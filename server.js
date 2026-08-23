@@ -18,14 +18,21 @@ if (!fs.existsSync(uploadsDir)) {
 // Serve uploaded static files
 app.use('/uploads', express.static(uploadsDir));
 
-// PostgreSQL Pool Connection
-const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'unilnk_db',
-  password: 'Warren#@22',
-  port: 5432,
-});
+// PostgreSQL Pool Connection (Supports Render Cloud & Local development)
+const pool = new Pool(
+  process.env.DATABASE_URL
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+      }
+    : {
+        user: 'postgres',
+        host: 'localhost',
+        database: 'unilnk_db',
+        password: 'Warren#@22',
+        port: 5432,
+      }
+);
 
 // Auto-Ensure 'campus' column exists in listings table on server startup
 pool.query(`
@@ -114,7 +121,7 @@ app.post('/api/listings', upload.any(), async (req, res) => {
 
   // Collect uploaded file URLs
   const imageUrls = req.files && req.files.length > 0
-    ? req.files.map(file => `http://localhost:5000/uploads/${file.filename}`)
+    ? req.files.map(file => `https://unilnk-backend-api.onrender.com/uploads/${file.filename}`)
     : [];
 
   const imagePayload = JSON.stringify(imageUrls);
@@ -279,5 +286,5 @@ app.delete('/api/listings/:id', async (req, res) => {
   }
 });
 
-const PORT = 5000;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
