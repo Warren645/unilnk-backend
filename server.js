@@ -34,10 +34,58 @@ const pool = new Pool(
       }
 );
 
-// Auto-Ensure 'campus' column exists in listings table on server startup
-pool.query(`
-  ALTER TABLE listings ADD COLUMN IF NOT EXISTS campus VARCHAR(255) DEFAULT 'Silverest Main Campus';
-`).catch(err => console.error('Column migration check error:', err.message));
+// Auto-Create Database Tables and Columns on Server Startup
+const initializeDatabase = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        full_name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        student_id VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS listings (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        price NUMERIC(10,2) NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        category VARCHAR(100),
+        campus VARCHAR(255) DEFAULT 'Silverest Main Campus',
+        seller_id INTEGER REFERENCES users(id),
+        image_url TEXT,
+        course_code VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        listing_id INTEGER REFERENCES listings(id),
+        buyer_id INTEGER REFERENCES users(id),
+        quantity INTEGER NOT NULL,
+        total_price NUMERIC(10,2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'RESERVED',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        transaction_id INTEGER REFERENCES transactions(id),
+        sender_id INTEGER REFERENCES users(id),
+        message_text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('Database tables verified and created successfully!');
+  } catch (err) {
+    console.error('Database initialization error:', err.message);
+  }
+};
+
+initializeDatabase();
 
 // Configure Multer Storage for File Uploads
 const storage = multer.diskStorage({
@@ -94,7 +142,6 @@ app.get('/api/listings', async (req, res) => {
   }
 });
 
-// Create Listing Endpoint with Campus Column Fixed
 app.post('/api/listings', upload.any(), async (req, res) => {
   let { title, description, price, quantity, category, campus, seller_id, course_code } = req.body;
   
@@ -102,10 +149,8 @@ app.post('/api/listings', upload.any(), async (req, res) => {
     return res.status(400).json({ success: false, error: 'Seller ID is required' });
   }
 
-  // Regex check for valid PostgreSQL UUID
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   
-  // If seller_id is an integer string like "5", resolve the true UUID from PostgreSQL
   if (!uuidRegex.test(seller_id)) {
     try {
       const userLookup = await pool.query(`SELECT id FROM users LIMIT 1`);
@@ -119,9 +164,8 @@ app.post('/api/listings', upload.any(), async (req, res) => {
     }
   }
 
-  // Collect uploaded file URLs
   const imageUrls = req.files && req.files.length > 0
-    ? req.files.map(file => `https://unilnk-backend-api.onrender.com/uploads/${file.filename}`)
+    ? req.files.map(file => `uploads/${file.filename}`)
     : [];
 
   const imagePayload = JSON.stringify(imageUrls);
