@@ -2,21 +2,30 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-}
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-// Serve uploaded static files
-app.use('/uploads', express.static(uploadsDir));
+// Configure Multer to use Cloudinary Storage
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'unilnk_listings',
+    allowed_formats: ['jpg', 'png', 'jpeg', 'webp'],
+  },
+});
+
+const upload = multer({ storage });
 
 // PostgreSQL Pool Connection (Supports Render Cloud & Local development)
 const pool = new Pool(
@@ -87,18 +96,6 @@ const initializeDatabase = async () => {
 
 initializeDatabase();
 
-// Configure Multer Storage for File Uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '_'));
-  },
-});
-
-const upload = multer({ storage });
-
 /* ================= AUTH ROUTES ================= */
 
 app.post('/api/auth/register', async (req, res) => {
@@ -157,15 +154,16 @@ app.post('/api/listings', upload.any(), async (req, res) => {
       if (userLookup.rows.length > 0) {
         seller_id = userLookup.rows[0].id;
       } else {
-        return res.status(400).json({ success: false, error: 'User UUID not found in database. Please log out and log in again.' });
+        return res.status(400).json({ success: false, error: 'User ID not found in database.' });
       }
     } catch (lookupErr) {
-      return res.status(500).json({ success: false, error: 'Failed to resolve user account UUID.' });
+      return res.status(500).json({ success: false, error: 'Failed to resolve user account.' });
     }
   }
 
+  // Extract direct secure URLs from Cloudinary uploads
   const imageUrls = req.files && req.files.length > 0
-    ? req.files.map(file => `uploads/${file.filename}`)
+    ? req.files.map(file => file.path)
     : [];
 
   const imagePayload = JSON.stringify(imageUrls);
