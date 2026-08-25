@@ -204,9 +204,12 @@ app.post('/api/transactions/reserve', async (req, res) => {
     }
 
     const price = listingRes.rows[0].price;
+    const currentQty = listingRes.rows[0].quantity;
     const totalPrice = price * quantity;
+    const newQuantity = currentQty - quantity;
 
-    await pool.query(`UPDATE listings SET quantity = quantity - $1 WHERE id = $2`, [quantity, listing_id]);
+    // Decrement stock upon reservation (Handshake handles complete deletion upon sale)
+    await pool.query(`UPDATE listings SET quantity = $1 WHERE id = $2`, [newQuantity, listing_id]);
 
     const txnRes = await pool.query(
       `INSERT INTO transactions (listing_id, buyer_id, quantity, total_price, status)
@@ -230,7 +233,13 @@ app.post('/api/transactions/handshake', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Transaction ID not found' });
     }
-    res.json({ success: true, transaction: result.rows[0] });
+
+    const transaction = result.rows[0];
+
+    // Delete listing only when the handshake confirms the item has been sold
+    await pool.query(`DELETE FROM listings WHERE id = $1`, [transaction.listing_id]);
+
+    res.json({ success: true, transaction: transaction, message: 'Transaction verified and listing removed from marketplace.' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
