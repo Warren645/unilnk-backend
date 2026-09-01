@@ -27,7 +27,7 @@ const storage = new CloudinaryStorage({
 
 const upload = multer({ storage });
 
-// PostgreSQL Pool Connection (Supports Render Cloud & Local development)
+// PostgreSQL Pool Connection
 const pool = new Pool(
   process.env.DATABASE_URL
     ? {
@@ -43,9 +43,10 @@ const pool = new Pool(
       }
 );
 
-// Auto-Create Database Tables and Columns on Server Startup
+// Auto-Create Database Tables
 const initializeDatabase = async () => {
   try {
+    // Add chat_messages table for direct seller-buyer chat
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -65,6 +66,7 @@ const initializeDatabase = async () => {
         category VARCHAR(100),
         campus VARCHAR(255) DEFAULT 'Silverest Main Campus',
         seller_id INTEGER REFERENCES users(id),
+        seller_name VARCHAR(255),
         image_url TEXT,
         course_code VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -87,6 +89,20 @@ const initializeDatabase = async () => {
         message_text TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+
+      -- NEW: Direct chat messages table (for seller-buyer chat without reservation)
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        sender_id INTEGER REFERENCES users(id),
+        receiver_id INTEGER REFERENCES users(id),
+        listing_id INTEGER REFERENCES listings(id),
+        message TEXT NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      -- Add seller_name to listings if not exists
+      ALTER TABLE listings ADD COLUMN IF NOT EXISTS seller_name VARCHAR(255);
     `);
     console.log('Database tables verified and created successfully!');
   } catch (err) {
@@ -132,7 +148,13 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/listings', async (req, res) => {
   try {
-    const result = await pool.query(`SELECT * FROM listings ORDER BY id DESC`);
+    // Include seller_name in the query
+    const result = await pool.query(`
+      SELECT l.*, u.full_name as seller_name 
+      FROM listings l 
+      LEFT JOIN users u ON l.seller_id = u.id 
+      ORDER BY l.id DESC
+    `);
     res.json({ success: true, data: result.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -146,22 +168,17 @@ app.post('/api/listings', upload.any(), async (req, res) => {
     return res.status(400).json({ success: false, error: 'Seller ID is required' });
   }
 
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  
-  if (!uuidRegex.test(seller_id)) {
-    try {
-      const userLookup = await pool.query(`SELECT id FROM users LIMIT 1`);
-      if (userLookup.rows.length > 0) {
-        seller_id = userLookup.rows[0].id;
-      } else {
-        return res.status(400).json({ success: false, error: 'User ID not found in database.' });
-      }
-    } catch (lookupErr) {
-      return res.status(500).json({ success: false, error: 'Failed to resolve user account.' });
+  // Get seller name
+  let seller_name = null;
+  try {
+    const userResult = await pool.query(`SELECT full_name FROM users WHERE id = $1`, [seller_id]);
+    if (userResult.rows.length > 0) {
+      seller_name = userResult.rows[0].full_name;
     }
+  } catch (err) {
+    console.error('Error fetching seller name:', err);
   }
 
-  // Extract direct secure URLs from Cloudinary uploads
   const imageUrls = req.files && req.files.length > 0
     ? req.files.map(file => file.path)
     : [];
@@ -172,8 +189,8 @@ app.post('/api/listings', upload.any(), async (req, res) => {
 
   try {
     const result = await pool.query(
-      `INSERT INTO listings (title, description, price, quantity, category, campus, seller_id, image_url, course_code)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      `INSERT INTO listings (title, description, price, quantity, category, campus, seller_id, seller_name, image_url, course_code)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
       [
         title, 
         description, 
@@ -182,6 +199,7 @@ app.post('/api/listings', upload.any(), async (req, res) => {
         category, 
         campusValue,
         seller_id, 
+        seller_name,
         imagePayload, 
         courseCodeValue
       ]
@@ -193,7 +211,7 @@ app.post('/api/listings', upload.any(), async (req, res) => {
   }
 });
 
-/* ================= TRANSACTION & CHAT ROUTES ================= */
+/* ================= TRANSACTION ROUTES ================= */
 
 app.post('/api/transactions/reserve', async (req, res) => {
   const { listing_id, buyer_id, quantity } = req.body;
@@ -208,7 +226,6 @@ app.post('/api/transactions/reserve', async (req, res) => {
     const totalPrice = price * quantity;
     const newQuantity = currentQty - quantity;
 
-    // Decrement stock upon reservation (Handshake handles complete deletion upon sale)
     await pool.query(`UPDATE listings SET quantity = $1 WHERE id = $2`, [newQuantity, listing_id]);
 
     const txnRes = await pool.query(
@@ -235,8 +252,6 @@ app.post('/api/transactions/handshake', async (req, res) => {
     }
 
     const transaction = result.rows[0];
-
-    // Delete listing only when the handshake confirms the item has been sold
     await pool.query(`DELETE FROM listings WHERE id = $1`, [transaction.listing_id]);
 
     res.json({ success: true, transaction: transaction, message: 'Transaction verified and listing removed from marketplace.' });
@@ -259,6 +274,101 @@ app.get('/api/users/:userId/dashboard', async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+/* ================= CHAT ROUTES (NEW - For Direct Seller-Buyer Chat) ================= */
+
+// Get chat history between two users
+app.get('/api/chat/:userId/:sellerId', async (req, res) => {
+  const { userId, sellerId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT cm.*, 
+        u1.full_name as sender_name, 
+        u2.full_name as receiver_name,
+        l.title as listing_title
+       FROM chat_messages cm
+       LEFT JOIN users u1 ON cm.sender_id = u1.id
+       LEFT JOIN users u2 ON cm.receiver_id = u2.id
+       LEFT JOIN listings l ON cm.listing_id = l.id
+       WHERE (cm.sender_id = $1 AND cm.receiver_id = $2)
+          OR (cm.sender_id = $2 AND cm.receiver_id = $1)
+       ORDER BY cm.created_at ASC`,
+      [userId, sellerId]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (err) {
+    console.error('Error fetching chat messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Send a chat message
+app.post('/api/chat/send', async (req, res) => {
+  const { sender_id, receiver_id, listing_id, message } = req.body;
+  
+  if (!sender_id || !receiver_id || !message) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO chat_messages (sender_id, receiver_id, listing_id, message)
+       VALUES ($1, $2, $3, $4) 
+       RETURNING *`,
+      [sender_id, receiver_id, listing_id || null, message]
+    );
+    
+    // Get sender name for response
+    const senderResult = await pool.query(
+      `SELECT full_name FROM users WHERE id = $1`,
+      [sender_id]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: {
+        ...result.rows[0],
+        sender_name: senderResult.rows[0]?.full_name || 'Student'
+      } 
+    });
+  } catch (err) {
+    console.error('Error sending message:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Mark messages as read
+app.put('/api/chat/mark-read', async (req, res) => {
+  const { userId, sellerId } = req.body;
+  try {
+    await pool.query(
+      `UPDATE chat_messages SET is_read = TRUE 
+       WHERE receiver_id = $1 AND sender_id = $2 AND is_read = FALSE`,
+      [userId, sellerId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get unread message count
+app.get('/api/chat/unread/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*) as unread_count 
+       FROM chat_messages 
+       WHERE receiver_id = $1 AND is_read = FALSE`,
+      [userId]
+    );
+    res.json({ success: true, unread_count: parseInt(result.rows[0].unread_count) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ================= TRANSACTION MESSAGES (Existing) ================= */
 
 app.get('/api/transactions/:txnId/messages', async (req, res) => {
   const { txnId } = req.params;
