@@ -27,26 +27,18 @@ const storage = new CloudinaryStorage({
 
 const upload = multer({ storage });
 
-// PostgreSQL Pool Connection
-const pool = new Pool(
-  process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false },
-      }
-    : {
-        user: 'postgres',
-        host: 'localhost',
-        database: 'unilnk_db',
-        password: 'Warren#@22',
-        port: 5432,
-      }
-);
+// PostgreSQL Pool Connection - RENDER CONFIGURATION
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
 // Auto-Create Database Tables
 const initializeDatabase = async () => {
   try {
-    // Add chat_messages table for direct seller-buyer chat
+    // Create users table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -56,7 +48,10 @@ const initializeDatabase = async () => {
         student_id VARCHAR(100),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
 
+    // Create listings table with seller_name
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS listings (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
@@ -71,7 +66,10 @@ const initializeDatabase = async () => {
         course_code VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
 
+    // Create transactions table
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS transactions (
         id SERIAL PRIMARY KEY,
         listing_id INTEGER REFERENCES listings(id),
@@ -81,7 +79,10 @@ const initializeDatabase = async () => {
         status VARCHAR(50) DEFAULT 'RESERVED',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
 
+    // Create messages table (for transaction-based chat)
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
         transaction_id INTEGER REFERENCES transactions(id),
@@ -89,8 +90,10 @@ const initializeDatabase = async () => {
         message_text TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
 
-      -- NEW: Direct chat messages table (for seller-buyer chat without reservation)
+    // Create chat_messages table (for direct seller-buyer chat)
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id SERIAL PRIMARY KEY,
         sender_id INTEGER REFERENCES users(id),
@@ -100,16 +103,20 @@ const initializeDatabase = async () => {
         is_read BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
 
-      -- Add seller_name to listings if not exists
+    // Add seller_name column if it doesn't exist
+    await pool.query(`
       ALTER TABLE listings ADD COLUMN IF NOT EXISTS seller_name VARCHAR(255);
     `);
-    console.log('Database tables verified and created successfully!');
+
+    console.log('✅ Database tables verified and created successfully!');
   } catch (err) {
-    console.error('Database initialization error:', err.message);
+    console.error('❌ Database initialization error:', err.message);
   }
 };
 
+// Call initialization
 initializeDatabase();
 
 /* ================= AUTH ROUTES ================= */
@@ -146,9 +153,9 @@ app.post('/api/auth/login', async (req, res) => {
 
 /* ================= LISTING ROUTES ================= */
 
+// GET all listings with seller name
 app.get('/api/listings', async (req, res) => {
   try {
-    // Include seller_name in the query
     const result = await pool.query(`
       SELECT l.*, u.full_name as seller_name 
       FROM listings l 
@@ -161,6 +168,7 @@ app.get('/api/listings', async (req, res) => {
   }
 });
 
+// CREATE new listing
 app.post('/api/listings', upload.any(), async (req, res) => {
   let { title, description, price, quantity, category, campus, seller_id, course_code } = req.body;
   
@@ -211,8 +219,43 @@ app.post('/api/listings', upload.any(), async (req, res) => {
   }
 });
 
+// UPDATE listing
+app.put('/api/listings/:id', async (req, res) => {
+  const { id } = req.params;
+  const { price, quantity, title, description } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE listings 
+       SET price = $1, quantity = $2, title = COALESCE($3, title), description = COALESCE($4, description)
+       WHERE id = $5 RETURNING *`,
+      [price, quantity, title, description, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+    res.json({ success: true, listing: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE listing
+app.delete('/api/listings/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(`DELETE FROM listings WHERE id = $1 RETURNING *`, [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+    res.json({ success: true, message: 'Listing deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /* ================= TRANSACTION ROUTES ================= */
 
+// Reserve an item
 app.post('/api/transactions/reserve', async (req, res) => {
   const { listing_id, buyer_id, quantity } = req.body;
   try {
@@ -240,6 +283,7 @@ app.post('/api/transactions/reserve', async (req, res) => {
   }
 });
 
+// Verify handshake
 app.post('/api/transactions/handshake', async (req, res) => {
   const { transaction_id } = req.body;
   try {
@@ -260,6 +304,7 @@ app.post('/api/transactions/handshake', async (req, res) => {
   }
 });
 
+// Get dashboard data
 app.get('/api/users/:userId/dashboard', async (req, res) => {
   const { userId } = req.params;
   try {
@@ -275,7 +320,53 @@ app.get('/api/users/:userId/dashboard', async (req, res) => {
   }
 });
 
-/* ================= CHAT ROUTES (NEW - For Direct Seller-Buyer Chat) ================= */
+// Get seller's listings
+app.get('/api/users/:userId/listings', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM listings WHERE seller_id = $1 ORDER BY id DESC`,
+      [userId]
+    );
+    res.json({ success: true, listings: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ================= TRANSACTION MESSAGES ================= */
+
+app.get('/api/transactions/:txnId/messages', async (req, res) => {
+  const { txnId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT m.id, m.message_text, u.full_name as sender_name, m.created_at
+       FROM messages m JOIN users u ON m.sender_id = u.id
+       WHERE m.transaction_id = $1 ORDER BY m.created_at ASC`,
+      [txnId]
+    );
+    res.json({ success: true, messages: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/transactions/:txnId/messages', async (req, res) => {
+  const { txnId } = req.params;
+  const { sender_id, message_text } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO messages (transaction_id, sender_id, message_text)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [txnId, sender_id, message_text]
+    );
+    res.json({ success: true, message: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ================= NEW: DIRECT CHAT ROUTES ================= */
 
 // Get chat history between two users
 app.get('/api/chat/:userId/:sellerId', async (req, res) => {
@@ -318,7 +409,6 @@ app.post('/api/chat/send', async (req, res) => {
       [sender_id, receiver_id, listing_id || null, message]
     );
     
-    // Get sender name for response
     const senderResult = await pool.query(
       `SELECT full_name FROM users WHERE id = $1`,
       [sender_id]
@@ -368,84 +458,16 @@ app.get('/api/chat/unread/:userId', async (req, res) => {
   }
 });
 
-/* ================= TRANSACTION MESSAGES (Existing) ================= */
+/* ================= HEALTH CHECK ================= */
 
-app.get('/api/transactions/:txnId/messages', async (req, res) => {
-  const { txnId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT m.id, m.message_text, u.full_name as sender_name, m.created_at
-       FROM messages m JOIN users u ON m.sender_id = u.id
-       WHERE m.transaction_id = $1 ORDER BY m.created_at ASC`,
-      [txnId]
-    );
-    res.json({ success: true, messages: result.rows });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+app.get('/api/health', (req, res) => {
+  res.json({ status: '✅ Server is running!', timestamp: new Date().toISOString() });
 });
 
-app.post('/api/transactions/:txnId/messages', async (req, res) => {
-  const { txnId } = req.params;
-  const { sender_id, message_text } = req.body;
-  try {
-    const result = await pool.query(
-      `INSERT INTO messages (transaction_id, sender_id, message_text)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [txnId, sender_id, message_text]
-    );
-    res.json({ success: true, message: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/* ================= SELLER INVENTORY ROUTES ================= */
-
-app.get('/api/users/:userId/listings', async (req, res) => {
-  const { userId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT * FROM listings WHERE seller_id = $1 ORDER BY id DESC`,
-      [userId]
-    );
-    res.json({ success: true, listings: result.rows });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.put('/api/listings/:id', async (req, res) => {
-  const { id } = req.params;
-  const { price, quantity, title, description } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE listings 
-       SET price = $1, quantity = $2, title = COALESCE($3, title), description = COALESCE($4, description)
-       WHERE id = $5 RETURNING *`,
-      [price, quantity, title, description, id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Listing not found' });
-    }
-    res.json({ success: true, listing: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete('/api/listings/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const result = await pool.query(`DELETE FROM listings WHERE id = $1 RETURNING *`, [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Listing not found' });
-    }
-    res.json({ success: true, message: 'Listing deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+/* ================= START SERVER ================= */
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Database: ${process.env.DATABASE_URL ? 'Render PostgreSQL' : 'Local PostgreSQL'}`);
+});
