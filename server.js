@@ -8,7 +8,7 @@ require('dotenv').config();
 
 const app = express();
 
-// ============ FIXED CORS - Allow all origins ============
+// CORS
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -16,7 +16,6 @@ app.use(cors({
   credentials: true
 }));
 app.options('*', cors());
-// =======================================================
 
 app.use(express.json());
 
@@ -79,31 +78,7 @@ const initializeDatabase = async () => {
       );
     `);
 
-    // Transactions table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS transactions (
-        id SERIAL PRIMARY KEY,
-        listing_id INTEGER REFERENCES listings(id),
-        buyer_id INTEGER REFERENCES users(id),
-        quantity INTEGER NOT NULL,
-        total_price NUMERIC(10,2) NOT NULL,
-        status VARCHAR(50) DEFAULT 'RESERVED',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Messages table (for transaction-based chat)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        transaction_id INTEGER REFERENCES transactions(id),
-        sender_id INTEGER REFERENCES users(id),
-        message_text TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Chat messages table (for direct seller-buyer chat)
+    // Chat messages table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id SERIAL PRIMARY KEY,
@@ -273,96 +248,6 @@ app.delete('/api/listings/:id', async (req, res) => {
   }
 });
 
-/* ================= TRANSACTION ROUTES ================= */
-
-app.post('/api/transactions/reserve', async (req, res) => {
-  const { listing_id, buyer_id, quantity } = req.body;
-  
-  console.log('📝 Reserve request:', { listing_id, buyer_id, quantity });
-
-  // Validate inputs
-  if (!listing_id || !buyer_id || !quantity) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Missing required fields: listing_id, buyer_id, quantity' 
-    });
-  }
-
-  try {
-    // Check if listing exists and has stock
-    const listingRes = await pool.query(`SELECT price, quantity FROM listings WHERE id = $1`, [listing_id]);
-    
-    if (listingRes.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Listing not found' });
-    }
-
-    if (listingRes.rows[0].quantity < quantity) {
-      return res.status(400).json({ success: false, error: 'Item out of stock' });
-    }
-
-    const price = listingRes.rows[0].price;
-    const currentQty = listingRes.rows[0].quantity;
-    const totalPrice = price * quantity;
-    const newQuantity = currentQty - quantity;
-
-    console.log('💰 Price:', price, 'Total:', totalPrice, 'New Qty:', newQuantity);
-
-    // Update stock
-    await pool.query(`UPDATE listings SET quantity = $1 WHERE id = $2`, [newQuantity, listing_id]);
-
-    // Create transaction
-    const txnRes = await pool.query(
-      `INSERT INTO transactions (listing_id, buyer_id, quantity, total_price, status)
-       VALUES ($1, $2, $3, $4, 'RESERVED') RETURNING *`,
-      [listing_id, buyer_id, quantity, totalPrice]
-    );
-
-    console.log('✅ Transaction created:', txnRes.rows[0].id);
-
-    res.json({ success: true, transaction: txnRes.rows[0] });
-  } catch (err) {
-    console.error('❌ Error reserving item:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/transactions/handshake', async (req, res) => {
-  const { transaction_id } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE transactions SET status = 'VERIFIED' WHERE id = $1 RETURNING *`,
-      [transaction_id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Transaction ID not found' });
-    }
-
-    const transaction = result.rows[0];
-    await pool.query(`DELETE FROM listings WHERE id = $1`, [transaction.listing_id]);
-
-    res.json({ success: true, transaction: transaction, message: 'Transaction verified and listing removed from marketplace.' });
-  } catch (err) {
-    console.error('Error verifying handshake:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/api/users/:userId/dashboard', async (req, res) => {
-  const { userId } = req.params;
-  try {
-    const purchases = await pool.query(
-      `SELECT t.id as transaction_id, l.title, t.total_price, t.status 
-       FROM transactions t JOIN listings l ON t.listing_id = l.id 
-       WHERE t.buyer_id = $1`,
-      [userId]
-    );
-    res.json({ success: true, purchases: purchases.rows, sales: [] });
-  } catch (err) {
-    console.error('Error fetching dashboard:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.get('/api/users/:userId/listings', async (req, res) => {
   const { userId } = req.params;
   try {
@@ -373,40 +258,6 @@ app.get('/api/users/:userId/listings', async (req, res) => {
     res.json({ success: true, listings: result.rows });
   } catch (err) {
     console.error('Error fetching seller listings:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/* ================= TRANSACTION MESSAGES ================= */
-
-app.get('/api/transactions/:txnId/messages', async (req, res) => {
-  const { txnId } = req.params;
-  try {
-    const result = await pool.query(
-      `SELECT m.id, m.message_text, u.full_name as sender_name, m.created_at
-       FROM messages m JOIN users u ON m.sender_id = u.id
-       WHERE m.transaction_id = $1 ORDER BY m.created_at ASC`,
-      [txnId]
-    );
-    res.json({ success: true, messages: result.rows });
-  } catch (err) {
-    console.error('Error fetching messages:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/transactions/:txnId/messages', async (req, res) => {
-  const { txnId } = req.params;
-  const { sender_id, message_text } = req.body;
-  try {
-    const result = await pool.query(
-      `INSERT INTO messages (transaction_id, sender_id, message_text)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [txnId, sender_id, message_text]
-    );
-    res.json({ success: true, message: result.rows[0] });
-  } catch (err) {
-    console.error('Error sending message:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
