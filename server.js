@@ -7,7 +7,17 @@ const { CloudinaryStorage } = require('multer-storage-cloudinary');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// ============ FIXED CORS - Allow all origins ============
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
+  credentials: true
+}));
+app.options('*', cors());
+// =======================================================
+
 app.use(express.json());
 
 // Configure Cloudinary
@@ -39,6 +49,7 @@ const pool = new Pool({
 // Initialize Database
 const initializeDatabase = async () => {
   try {
+    // Users table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -50,6 +61,7 @@ const initializeDatabase = async () => {
       );
     `);
 
+    // Listings table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS listings (
         id SERIAL PRIMARY KEY,
@@ -67,6 +79,7 @@ const initializeDatabase = async () => {
       );
     `);
 
+    // Transactions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS transactions (
         id SERIAL PRIMARY KEY,
@@ -79,6 +92,7 @@ const initializeDatabase = async () => {
       );
     `);
 
+    // Messages table (for transaction-based chat)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -89,6 +103,7 @@ const initializeDatabase = async () => {
       );
     `);
 
+    // Chat messages table (for direct seller-buyer chat)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS chat_messages (
         id SERIAL PRIMARY KEY,
@@ -101,6 +116,7 @@ const initializeDatabase = async () => {
       );
     `);
 
+    // Add seller_name column if it doesn't exist
     await pool.query(`
       ALTER TABLE listings ADD COLUMN IF NOT EXISTS seller_name VARCHAR(255);
     `);
@@ -261,9 +277,26 @@ app.delete('/api/listings/:id', async (req, res) => {
 
 app.post('/api/transactions/reserve', async (req, res) => {
   const { listing_id, buyer_id, quantity } = req.body;
+  
+  console.log('📝 Reserve request:', { listing_id, buyer_id, quantity });
+
+  // Validate inputs
+  if (!listing_id || !buyer_id || !quantity) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing required fields: listing_id, buyer_id, quantity' 
+    });
+  }
+
   try {
+    // Check if listing exists and has stock
     const listingRes = await pool.query(`SELECT price, quantity FROM listings WHERE id = $1`, [listing_id]);
-    if (listingRes.rows.length === 0 || listingRes.rows[0].quantity < quantity) {
+    
+    if (listingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+
+    if (listingRes.rows[0].quantity < quantity) {
       return res.status(400).json({ success: false, error: 'Item out of stock' });
     }
 
@@ -272,17 +305,23 @@ app.post('/api/transactions/reserve', async (req, res) => {
     const totalPrice = price * quantity;
     const newQuantity = currentQty - quantity;
 
+    console.log('💰 Price:', price, 'Total:', totalPrice, 'New Qty:', newQuantity);
+
+    // Update stock
     await pool.query(`UPDATE listings SET quantity = $1 WHERE id = $2`, [newQuantity, listing_id]);
 
+    // Create transaction
     const txnRes = await pool.query(
       `INSERT INTO transactions (listing_id, buyer_id, quantity, total_price, status)
        VALUES ($1, $2, $3, $4, 'RESERVED') RETURNING *`,
       [listing_id, buyer_id, quantity, totalPrice]
     );
 
+    console.log('✅ Transaction created:', txnRes.rows[0].id);
+
     res.json({ success: true, transaction: txnRes.rows[0] });
   } catch (err) {
-    console.error('Error reserving item:', err);
+    console.error('❌ Error reserving item:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -549,4 +588,13 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Database: ${process.env.DATABASE_URL ? 'Render PostgreSQL' : 'Local PostgreSQL'}`);
+});
+
+// Handle uncaught errors
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Unhandled Rejection:', err);
 });
