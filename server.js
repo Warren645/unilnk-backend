@@ -535,6 +535,59 @@ app.post('/api/auth/login', async (req, res) => {
 
 
 /* =========================================================
+   JWT AUTHENTICATION MIDDLEWARE
+   ========================================================= */
+
+const authenticateToken = (req, res, next) => {
+
+  const authHeader = req.headers.authorization;
+
+  const token =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]
+      : null;
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required'
+    });
+  }
+
+  if (!process.env.JWT_SECRET) {
+    return res.status(500).json({
+      success: false,
+      error: 'Server authentication is not configured'
+    });
+  }
+
+  try {
+
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
+    req.user = decoded;
+
+    next();
+
+  } catch (err) {
+
+    console.error(
+      'JWT verification error:',
+      err.message
+    );
+
+    return res.status(403).json({
+      success: false,
+      error: 'Invalid or expired authentication token'
+    });
+  }
+};
+
+
+/* =========================================================
    LISTING ROUTES
    ========================================================= */
 
