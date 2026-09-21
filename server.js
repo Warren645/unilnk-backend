@@ -639,6 +639,7 @@ app.get('/api/listings', async (req, res) => {
 
 app.post(
   '/api/listings',
+    authenticateToken,
   upload.any(),
   async (req, res) => {
 
@@ -651,7 +652,6 @@ app.post(
         quantity,
         category,
         campus,
-        seller_id,
         course_code
       } = req.body;
 
@@ -678,6 +678,8 @@ app.post(
             'Price is required'
         });
       }
+       //Get the seller ID from the verified JWT.
+       const seller_id = req.user.id;
 
       if (!seller_id) {
 
@@ -823,7 +825,10 @@ app.post(
   UPDATE LISTING
 */
 
-app.put('/api/listings/:id', async (req, res) => {
+app.put(
+   '/api/listings/:id', 
+   authenticateToken,
+   async (req, res) => {
 
   const { id } =
     req.params;
@@ -898,7 +903,10 @@ app.put('/api/listings/:id', async (req, res) => {
   DELETE LISTING
 */
 
-app.delete('/api/listings/:id', async (req, res) => {
+app.delete(
+   '/api/listings/:id',
+   authenticateToken,
+   async (req, res) => {
 
   const { id } =
     req.params;
@@ -956,11 +964,18 @@ app.delete('/api/listings/:id', async (req, res) => {
 
 app.get(
   '/api/users/:userId/listings',
+   authenticateToken,
   async (req, res) => {
 
     const {
       userId
     } = req.params;
+     if (Number(userId) !== Number(req.user.id)) {
+  return res.status(403).json({
+    success: false,
+    error: 'You are not authorized to access this account'
+  });
+}
 
     try {
 
@@ -1010,11 +1025,18 @@ app.get(
 
 app.get(
   '/api/chat/conversations/:userId',
+   authenticateToken,
   async (req, res) => {
 
     const {
       userId
     } = req.params;
+     if (Number(userId) !== Number(req.user.id)) {
+  return res.status(403).json({
+    success: false,
+    error: 'You are not authorized to access this account'
+  });
+}
 
     try {
 
@@ -1177,11 +1199,18 @@ app.get(
 
 app.get(
   '/api/chat/unread/total/:userId',
+   authenticateToken,
   async (req, res) => {
 
     const {
       userId
     } = req.params;
+     if (Number(userId) !== Number(req.user.id)) {
+  return res.status(403).json({
+    success: false,
+    error: 'You are not authorized to access this account'
+  });
+}
 
     try {
 
@@ -1230,12 +1259,19 @@ app.get(
 
 app.put(
   '/api/chat/mark-read/:userId/:otherUserId',
+   authenticateToken,
   async (req, res) => {
 
     const {
       userId,
       otherUserId
     } = req.params;
+     if (Number(userId) !== Number(req.user.id)) {
+  return res.status(403).json({
+    success: false,
+    error: 'You are not authorized to access this account'
+  });
+}
 
     try {
 
@@ -1283,12 +1319,19 @@ app.put(
 
 app.get(
   '/api/chat/messages/:userId/:otherUserId',
+   authenticateToken,
   async (req, res) => {
 
     const {
       userId,
       otherUserId
     } = req.params;
+     if (Number(userId) !== Number(req.user.id)) {
+  return res.status(403).json({
+    success: false,
+    error: 'You are not authorized to access this account'
+  });
+}
 
     const limit =
       parseInt(req.query.limit) || 50;
@@ -1382,20 +1425,21 @@ app.get(
 
 app.post(
   '/api/chat/send',
+   authenticateToken,
   async (req, res) => {
 
     const {
-      sender_id,
       receiver_id,
       listing_id,
       message
     } = req.body;
+     
 
     if (
-      !sender_id ||
       !receiver_id ||
       !message?.trim()
     ) {
+       const sender_id = req.user.id;
 
       return res.status(400).json({
         success: false,
