@@ -25,8 +25,14 @@ if (!process.env.JWT_SECRET) {
    ========================================================= */
 
 app.use(
+ 
+app.use(
   cors({
-    origin: '*',
+    origin: [
+      'https://unilnk.vercel.app',
+      'http://localhost:5173',
+      'http://127.0.0.1:5173'
+    ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
