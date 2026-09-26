@@ -1426,7 +1426,6 @@ app.get(
 */
 
 app.post(
-pp.post(
   '/api/chat/send',
   authenticateToken,
   async (req, res) => {
