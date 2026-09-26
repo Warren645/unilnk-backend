@@ -24,7 +24,7 @@ if (!process.env.JWT_SECRET) {
    CORS
    ========================================================= */
 
-app.use(
+
  
 app.use(
   cors({
