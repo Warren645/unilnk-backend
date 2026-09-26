@@ -853,7 +853,7 @@ app.put(
             title = COALESCE($3, title),
             description = COALESCE($4, description)
 
-          WHERE id = $5
+          WHERE id = $5 AND seller_id = $6
 
           RETURNING *
         `,
@@ -862,7 +862,8 @@ app.put(
           quantity,
           title,
           description,
-          id
+          id,
+           req.user.id
         ]
       );
 
@@ -873,7 +874,7 @@ app.put(
       return res.status(404).json({
         success: false,
         error:
-          'Listing not found'
+          'Listing not found or you are not authorized to edit it'
       });
     }
 
@@ -918,11 +919,12 @@ app.delete(
         `
           DELETE FROM listings
 
-          WHERE id = $1
+          WHERE id = $1 AND seller_id = $2
+
 
           RETURNING *
         `,
-        [id]
+        [id,req.user.id]
       );
 
     if (
@@ -932,7 +934,7 @@ app.delete(
       return res.status(404).json({
         success: false,
         error:
-          'Listing not found'
+          'Listing not found or you are not authorized to delete it'
       });
     }
 
