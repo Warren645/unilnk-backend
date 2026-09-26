@@ -1426,98 +1426,98 @@ app.get(
 */
 
 app.post(
+pp.post(
   '/api/chat/send',
-   authenticateToken,
+  authenticateToken,
   async (req, res) => {
+    const sender_id = req.user.id;
 
     const {
       receiver_id,
       listing_id,
       message
     } = req.body;
-     
 
     if (
       !receiver_id ||
-      !message?.trim()
+      !message ||
+      typeof message !== 'string' ||
+      !message.trim()
     ) {
-       const sender_id = req.user.id;
-
       return res.status(400).json({
         success: false,
-        error:
-          'Missing required fields'
+        error: 'Missing or invalid required fields'
+      });
+    }
+
+    if (Number(receiver_id) === Number(sender_id)) {
+      return res.status(400).json({
+        success: false,
+        error: 'You cannot send a message to yourself'
       });
     }
 
     try {
+      const recipientResult = await pool.query(
+        'SELECT id FROM users WHERE id = $1',
+        [receiver_id]
+      );
 
-      const result =
-        await pool.query(
-          `
-            INSERT INTO chat_messages
-            (
-              sender_id,
-              receiver_id,
-              listing_id,
-              message
-            )
+      if (recipientResult.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Recipient not found'
+        });
+      }
 
-            VALUES
-            (
-              $1,
-              $2,
-              $3,
-              $4
-            )
-
-            RETURNING *
-          `,
-          [
+      const result = await pool.query(
+        `
+          INSERT INTO chat_messages
+          (
             sender_id,
             receiver_id,
-            listing_id || null,
-            message.trim()
-          ]
-        );
+            listing_id,
+            message
+          )
+          VALUES ($1, $2, $3, $4)
+          RETURNING *
+        `,
+        [
+          sender_id,
+          receiver_id,
+          listing_id || null,
+          message.trim()
+        ]
+      );
 
-      const senderResult =
-        await pool.query(
-          `
-            SELECT full_name
-            FROM users
-            WHERE id = $1
-          `,
-          [sender_id]
-        );
+      const senderResult = await pool.query(
+        `
+          SELECT full_name
+          FROM users
+          WHERE id = $1
+        `,
+        [sender_id]
+      );
 
       res.json({
         success: true,
-
         message: {
           ...result.rows[0],
-
           sender_name:
-            senderResult.rows[0]
-              ?.full_name ||
-            'Student'
+            senderResult.rows[0]?.full_name || 'Student'
         }
       });
 
     } catch (err) {
-
-      console.error(
-        'Error sending message:',
-        err
-      );
+      console.error('Error sending message:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Failed to send message'
       });
     }
   }
+
 );
 
 
