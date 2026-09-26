@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -16,7 +17,7 @@ const app = express();
 
 if (!process.env.JWT_SECRET) {
   console.warn(
-    '⚠️ JWT_SECRET is not configured. Authentication routes will reject requests.'
+    'JWT_SECRET is not configured. Authentication routes will reject requests.'
   );
 }
 
@@ -24,8 +25,6 @@ if (!process.env.JWT_SECRET) {
    CORS
    ========================================================= */
 
-
- 
 app.use(
   cors({
     origin: [
@@ -43,8 +42,6 @@ app.use(
     credentials: true
   })
 );
-
-
 
 /* =========================================================
    JSON BODY PARSER
@@ -68,33 +65,18 @@ cloudinary.config({
 
 const storage = new CloudinaryStorage({
   cloudinary: cloudinary,
-
   params: {
     folder: 'unilnk_listings',
-
-    allowed_formats: [
-      'jpg',
-      'png',
-      'jpeg',
-      'webp'
-    ]
+    allowed_formats: ['jpg', 'png', 'jpeg', 'webp']
   }
 });
 
-/*
-  Maximum:
-  - 5 images per listing
-  - 5 MB per image
-*/
-
 const upload = multer({
   storage,
-
   limits: {
     files: 5,
     fileSize: 5 * 1024 * 1024
   },
-
   fileFilter: (req, file, cb) => {
     const allowedMimeTypes = [
       'image/jpeg',
@@ -116,7 +98,6 @@ const upload = multer({
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-
   ssl: {
     rejectUnauthorized: false
   }
@@ -156,7 +137,9 @@ const initializeDatabase = async () => {
         seller_name VARCHAR(255),
         image_url TEXT,
         course_code VARCHAR(50),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_sold BOOLEAN NOT NULL DEFAULT FALSE,
+        sold_at TIMESTAMP WITHOUT TIME ZONE
       );
     `);
 
@@ -181,18 +164,118 @@ const initializeDatabase = async () => {
       ADD COLUMN IF NOT EXISTS seller_name VARCHAR(255);
     `);
 
+    await pool.query(`
+      ALTER TABLE listings
+      ADD COLUMN IF NOT EXISTS is_sold BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+
+    await pool.query(`
+      ALTER TABLE listings
+      ADD COLUMN IF NOT EXISTS sold_at TIMESTAMP WITHOUT TIME ZONE;
+    `);
+
     console.log(
-      '✅ Database tables verified and created successfully!'
+      'Database tables and sold-listing columns verified successfully.'
     );
   } catch (err) {
     console.error(
-      '❌ Database initialization error:',
+      'Database initialization error:',
       err.message
     );
+
+    throw err;
   }
 };
 
-initializeDatabase();
+/* =========================================================
+   AUTOMATIC SOLD-LISTING CLEANUP
+   Delete sold listings after five days.
+   ========================================================= */
+
+const cleanupSoldListings = async () => {
+  let client;
+
+  try {
+    client = await pool.connect();
+
+    await client.query('BEGIN');
+
+    /*
+      Chat messages reference listings through a foreign key.
+      Clear the listing reference for messages associated with
+      listings that are due for deletion.
+      The messages themselves are preserved.
+    */
+
+    await client.query(`
+      UPDATE chat_messages
+      SET listing_id = NULL
+      WHERE listing_id IN (
+        SELECT id
+        FROM listings
+        WHERE is_sold = TRUE
+          AND sold_at IS NOT NULL
+          AND sold_at <= CURRENT_TIMESTAMP - INTERVAL '5 days'
+      );
+    `);
+
+    const result = await client.query(`
+      DELETE FROM listings
+      WHERE is_sold = TRUE
+        AND sold_at IS NOT NULL
+        AND sold_at <= CURRENT_TIMESTAMP - INTERVAL '5 days';
+    `);
+
+    await client.query('COMMIT');
+
+    if (result.rowCount > 0) {
+      console.log(
+        `Automatically deleted ${result.rowCount} sold listing(s).`
+      );
+    }
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error(
+          'Cleanup rollback error:',
+          rollbackError.message
+        );
+      }
+    }
+
+    console.error(
+      'Sold-listing cleanup error:',
+      err.message
+    );
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+};
+
+/*
+  Initialize the database before running cleanup.
+  Repeat cleanup every hour while the backend is running.
+*/
+
+initializeDatabase()
+  .then(() => {
+    cleanupSoldListings();
+
+    setInterval(
+      cleanupSoldListings,
+      60 * 60 * 1000
+    );
+  })
+  .catch((err) => {
+    console.error(
+      'Backend database initialization failed:',
+      err.message
+    );
+  });
 
 /* =========================================================
    AUTH ROUTES
@@ -211,8 +294,6 @@ app.post('/api/auth/register', async (req, res) => {
     student_id
   } = req.body;
 
-  /* ================= VALIDATION ================= */
-
   if (
     !full_name?.trim() ||
     !email?.trim() ||
@@ -221,38 +302,26 @@ app.post('/api/auth/register', async (req, res) => {
   ) {
     return res.status(400).json({
       success: false,
-      error:
-        'Full name, email, password and student ID are required'
+      error: 'Full name, email, password and student ID are required'
     });
   }
 
   if (password.length < 6) {
     return res.status(400).json({
       success: false,
-      error:
-        'Password must be at least 6 characters long'
+      error: 'Password must be at least 6 characters long'
     });
   }
 
   if (!process.env.JWT_SECRET) {
-    console.error(
-      'JWT_SECRET is missing from environment variables'
-    );
-
     return res.status(500).json({
       success: false,
-      error:
-        'Server authentication is not configured'
+      error: 'Server authentication is not configured'
     });
   }
 
   try {
-    /* ================= NORMALIZE EMAIL ================= */
-
-    const normalizedEmail =
-      email.trim().toLowerCase();
-
-    /* ================= CHECK DUPLICATE ================= */
+    const normalizedEmail = email.trim().toLowerCase();
 
     const existingUser = await pool.query(
       `
@@ -266,41 +335,18 @@ app.post('/api/auth/register', async (req, res) => {
     if (existingUser.rows.length > 0) {
       return res.status(409).json({
         success: false,
-        error:
-          'An account with this email already exists'
+        error: 'An account with this email already exists'
       });
     }
 
-    /* ================= HASH PASSWORD ================= */
-
-    const passwordHash =
-      await bcrypt.hash(password, 12);
-
-    /* ================= CREATE USER ================= */
+    const passwordHash = await bcrypt.hash(password, 12);
 
     const result = await pool.query(
       `
         INSERT INTO users
-        (
-          full_name,
-          email,
-          password_hash,
-          student_id
-        )
-
-        VALUES
-        (
-          $1,
-          $2,
-          $3,
-          $4
-        )
-
-        RETURNING
-          id,
-          full_name,
-          email,
-          student_id
+          (full_name, email, password_hash, student_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, full_name, email, student_id
       `,
       [
         full_name.trim(),
@@ -312,52 +358,38 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user = result.rows[0];
 
-    /* ================= CREATE JWT ================= */
-
     const token = jwt.sign(
       {
         id: user.id,
         email: user.email
       },
-
       process.env.JWT_SECRET,
-
       {
         expiresIn: '7d'
       }
     );
-
-    /* ================= RESPONSE ================= */
 
     res.status(201).json({
       success: true,
       user,
       token
     });
-
   } catch (err) {
-
-    console.error(
-      'Registration error:',
-      err
-    );
+    console.error('Registration error:', err);
 
     if (err.code === '23505') {
       return res.status(409).json({
         success: false,
-        error:
-          'An account with this email already exists'
+        error: 'An account with this email already exists'
       });
     }
 
     res.status(500).json({
       success: false,
-      error:
-        'Unable to create account'
+      error: 'Unable to create account'
     });
   }
 });
-
 
 /*
   LOGIN
@@ -365,47 +397,24 @@ app.post('/api/auth/register', async (req, res) => {
 */
 
 app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
 
-  const {
-    email,
-    password
-  } = req.body;
-
-  /* ================= VALIDATION ================= */
-
-  if (
-    !email?.trim() ||
-    !password
-  ) {
-
+  if (!email?.trim() || !password) {
     return res.status(400).json({
       success: false,
-      error:
-        'Email and password are required'
+      error: 'Email and password are required'
     });
   }
 
   if (!process.env.JWT_SECRET) {
-
-    console.error(
-      'JWT_SECRET is missing from environment variables'
-    );
-
     return res.status(500).json({
       success: false,
-      error:
-        'Server authentication is not configured'
+      error: 'Server authentication is not configured'
     });
   }
 
   try {
-
-    /* ================= NORMALIZE EMAIL ================= */
-
-    const normalizedEmail =
-      email.trim().toLowerCase();
-
-    /* ================= FIND USER ================= */
+    const normalizedEmail = email.trim().toLowerCase();
 
     const result = await pool.query(
       `
@@ -415,98 +424,59 @@ app.post('/api/auth/login', async (req, res) => {
           email,
           password_hash,
           student_id
-
         FROM users
-
         WHERE LOWER(email) = $1
       `,
       [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
-
       return res.status(401).json({
         success: false,
-        error:
-          'Invalid email or password'
+        error: 'Invalid email or password'
       });
     }
 
-    const dbUser =
-      result.rows[0];
+    const dbUser = result.rows[0];
 
     let passwordMatches = false;
 
-    /* =====================================================
-       NEW USERS
-       PASSWORD IS BCRYPT HASHED
-       ===================================================== */
-
-    if (
-      dbUser.password_hash?.startsWith('$2')
-    ) {
-
-      passwordMatches =
-        await bcrypt.compare(
-          password,
-          dbUser.password_hash
-        );
-
+    if (dbUser.password_hash?.startsWith('$2')) {
+      passwordMatches = await bcrypt.compare(
+        password,
+        dbUser.password_hash
+      );
     } else {
+      /*
+        Upgrade old plaintext passwords after a successful login.
+      */
 
-      /* ===================================================
-         OLD USERS
-
-         This compatibility section allows accounts
-         created before this security update to log in.
-
-         After successful login, their password is
-         immediately converted to a bcrypt hash.
-         =================================================== */
-
-      passwordMatches =
-        dbUser.password_hash === password;
+      passwordMatches = dbUser.password_hash === password;
 
       if (passwordMatches) {
-
-        const upgradedHash =
-          await bcrypt.hash(
-            password,
-            12
-          );
+        const upgradedHash = await bcrypt.hash(password, 12);
 
         await pool.query(
           `
             UPDATE users
-
             SET password_hash = $1
-
             WHERE id = $2
           `,
-          [
-            upgradedHash,
-            dbUser.id
-          ]
+          [upgradedHash, dbUser.id]
         );
 
         console.log(
-          `🔐 Upgraded legacy password hash for user ${dbUser.id}`
+          `Upgraded legacy password hash for user ${dbUser.id}`
         );
       }
     }
 
-    /* ================= INVALID PASSWORD ================= */
-
     if (!passwordMatches) {
-
       return res.status(401).json({
         success: false,
-        error:
-          'Invalid email or password'
+        error: 'Invalid email or password'
       });
     }
-
-    /* ================= USER OBJECT ================= */
 
     const user = {
       id: dbUser.id,
@@ -515,51 +485,37 @@ app.post('/api/auth/login', async (req, res) => {
       student_id: dbUser.student_id
     };
 
-    /* ================= CREATE JWT ================= */
-
     const token = jwt.sign(
       {
         id: user.id,
         email: user.email
       },
-
       process.env.JWT_SECRET,
-
       {
         expiresIn: '7d'
       }
     );
-
-    /* ================= RESPONSE ================= */
 
     res.json({
       success: true,
       user,
       token
     });
-
   } catch (err) {
-
-    console.error(
-      'Login error:',
-      err
-    );
+    console.error('Login error:', err);
 
     res.status(500).json({
       success: false,
-      error:
-        'Unable to log in'
+      error: 'Unable to log in'
     });
   }
 });
-
 
 /* =========================================================
    JWT AUTHENTICATION MIDDLEWARE
    ========================================================= */
 
 const authenticateToken = (req, res, next) => {
-
   const authHeader = req.headers.authorization;
 
   const token =
@@ -582,7 +538,6 @@ const authenticateToken = (req, res, next) => {
   }
 
   try {
-
     const decoded = jwt.verify(
       token,
       process.env.JWT_SECRET
@@ -591,13 +546,8 @@ const authenticateToken = (req, res, next) => {
     req.user = decoded;
 
     next();
-
   } catch (err) {
-
-    console.error(
-      'JWT verification error:',
-      err.message
-    );
+    console.error('JWT verification error:', err.message);
 
     return res.status(403).json({
       success: false,
@@ -606,29 +556,25 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
-
 /* =========================================================
    LISTING ROUTES
    ========================================================= */
 
 /*
-  GET ALL LISTINGS
+  GET ACTIVE LISTINGS
+  Sold listings are hidden from marketplace browsing.
 */
 
 app.get('/api/listings', async (req, res) => {
-
   try {
-
     const result = await pool.query(`
       SELECT
         l.*,
         u.full_name AS seller_name
-
       FROM listings l
-
       LEFT JOIN users u
         ON l.seller_id = u.id
-
+      WHERE l.is_sold = FALSE
       ORDER BY l.id DESC
     `);
 
@@ -636,22 +582,15 @@ app.get('/api/listings', async (req, res) => {
       success: true,
       data: result.rows
     });
-
   } catch (err) {
-
-    console.error(
-      'Error fetching listings:',
-      err
-    );
+    console.error('Error fetching listings:', err);
 
     res.status(500).json({
       success: false,
-      error:
-        err.message
+      error: 'Unable to fetch listings'
     });
   }
 });
-
 
 /*
   CREATE LISTING
@@ -659,13 +598,11 @@ app.get('/api/listings', async (req, res) => {
 
 app.post(
   '/api/listings',
-    authenticateToken,
+  authenticateToken,
   upload.any(),
   async (req, res) => {
-
     try {
-
-      let {
+      const {
         title,
         description,
         price,
@@ -675,14 +612,10 @@ app.post(
         course_code
       } = req.body;
 
-      /* ================= VALIDATION ================= */
-
       if (!title?.trim()) {
-
         return res.status(400).json({
           success: false,
-          error:
-            'Title is required'
+          error: 'Title is required'
         });
       }
 
@@ -691,351 +624,312 @@ app.post(
         price === null ||
         price === ''
       ) {
-
         return res.status(400).json({
           success: false,
-          error:
-            'Price is required'
-        });
-      }
-       //Get the seller ID from the verified JWT.
-       const seller_id = req.user.id;
-
-      if (!seller_id) {
-
-        return res.status(400).json({
-          success: false,
-          error:
-            'Seller ID is required'
+          error: 'Price is required'
         });
       }
 
-      /* ================= GET SELLER ================= */
+      const seller_id = req.user.id;
 
-      let seller_name = null;
+      const userResult = await pool.query(
+        `
+          SELECT full_name
+          FROM users
+          WHERE id = $1
+        `,
+        [seller_id]
+      );
 
-      try {
-
-        const userResult =
-          await pool.query(
-            `
-              SELECT full_name
-              FROM users
-              WHERE id = $1
-            `,
-            [seller_id]
-          );
-
-        if (
-          userResult.rows.length > 0
-        ) {
-
-          seller_name =
-            userResult.rows[0].full_name;
-        }
-
-      } catch (err) {
-
-        console.error(
-          'Error fetching seller name:',
-          err
-        );
-      }
-
-      /* ================= IMAGES ================= */
+      const seller_name =
+        userResult.rows[0]?.full_name || null;
 
       const imageUrls =
-        req.files &&
-        req.files.length > 0
-          ? req.files.map(
-              file => file.path
-            )
+        req.files && req.files.length > 0
+          ? req.files.map((file) => file.path)
           : [];
 
-      const imagePayload =
-        JSON.stringify(imageUrls);
+      const imagePayload = JSON.stringify(imageUrls);
 
-      /* ================= DEFAULTS ================= */
+      const courseCodeValue = course_code || 'GEN001';
+      const campusValue = campus || 'Silverest Main Campus';
 
-      const courseCodeValue =
-        course_code || 'GEN001';
-
-      const campusValue =
-        campus ||
-        'Silverest Main Campus';
-
+      const parsedQuantity = Number.parseInt(quantity, 10);
       const quantityValue =
-        parseInt(quantity, 10) || 1;
+        Number.isInteger(parsedQuantity) && parsedQuantity > 0
+          ? parsedQuantity
+          : 1;
 
-      const priceValue =
-        parseFloat(price) || 0;
+      const priceValue = Number(price);
 
-      /* ================= INSERT ================= */
+      if (!Number.isFinite(priceValue) || priceValue < 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Price must be a valid non-negative number'
+        });
+      }
 
-      const result =
-        await pool.query(
-          `
-            INSERT INTO listings
-            (
-              title,
-              description,
-              price,
-              quantity,
-              category,
-              campus,
-              seller_id,
-              seller_name,
-              image_url,
-              course_code
-            )
-
-            VALUES
-            (
-              $1,
-              $2,
-              $3,
-              $4,
-              $5,
-              $6,
-              $7,
-              $8,
-              $9,
-              $10
-            )
-
-            RETURNING *
-          `,
-          [
-            title.trim(),
-            description || '',
-            priceValue,
-            quantityValue,
-            category || 'Other',
-            campusValue,
+      const result = await pool.query(
+        `
+          INSERT INTO listings
+          (
+            title,
+            description,
+            price,
+            quantity,
+            category,
+            campus,
             seller_id,
             seller_name,
-            imagePayload,
-            courseCodeValue
-          ]
-        );
+            image_url,
+            course_code
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          RETURNING *
+        `,
+        [
+          title.trim(),
+          description || '',
+          priceValue,
+          quantityValue,
+          category || 'Other',
+          campusValue,
+          seller_id,
+          seller_name,
+          imagePayload,
+          courseCodeValue
+        ]
+      );
 
       res.json({
         success: true,
         data: result.rows[0]
       });
-
     } catch (err) {
-
-      console.error(
-        'Error creating listing:',
-        err
-      );
+      console.error('Error creating listing:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to create listing'
       });
     }
   }
 );
 
-
 /*
   UPDATE LISTING
+  Only the owner can update an unsold listing.
 */
 
 app.put(
-   '/api/listings/:id', 
-   authenticateToken,
-   async (req, res) => {
+  '/api/listings/:id',
+  authenticateToken,
+  async (req, res) => {
+    const { id } = req.params;
 
-  const { id } =
-    req.params;
+    const {
+      price,
+      quantity,
+      title,
+      description
+    } = req.body;
 
-  const {
-    price,
-    quantity,
-    title,
-    description
-  } = req.body;
-
-  try {
-
-    const result =
-      await pool.query(
+    try {
+      const result = await pool.query(
         `
           UPDATE listings
-
           SET
-            price = $1,
-            quantity = $2,
+            price = COALESCE($1, price),
+            quantity = COALESCE($2, quantity),
             title = COALESCE($3, title),
             description = COALESCE($4, description)
-
-          WHERE id = $5 AND seller_id = $6
-
+          WHERE
+            id = $5
+            AND seller_id = $6
+            AND is_sold = FALSE
           RETURNING *
         `,
         [
-          price,
-          quantity,
+          price ?? null,
+          quantity ?? null,
           title,
           description,
           id,
-           req.user.id
+          req.user.id
         ]
       );
 
-    if (
-      result.rows.length === 0
-    ) {
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Listing not found, already sold, or you are not authorized to edit it'
+        });
+      }
 
-      return res.status(404).json({
+      res.json({
+        success: true,
+        listing: result.rows[0]
+      });
+    } catch (err) {
+      console.error('Error updating listing:', err);
+
+      res.status(500).json({
         success: false,
-        error:
-          'Listing not found or you are not authorized to edit it'
+        error: 'Unable to update listing'
       });
     }
-
-    res.json({
-      success: true,
-      listing:
-        result.rows[0]
-    });
-
-  } catch (err) {
-
-    console.error(
-      'Error updating listing:',
-      err
-    );
-
-    res.status(500).json({
-      success: false,
-      error:
-        err.message
-    });
   }
-});
+);
 
+/*
+  MARK LISTING AS SOLD
+  Only the owner can mark a listing as sold.
+*/
+
+app.put(
+  '/api/listings/:id/sold',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const listingId = Number(req.params.id);
+
+      if (!Number.isInteger(listingId) || listingId < 1) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid listing ID'
+        });
+      }
+
+      const result = await pool.query(
+        `
+          UPDATE listings
+          SET
+            is_sold = TRUE,
+            sold_at = CURRENT_TIMESTAMP
+          WHERE
+            id = $1
+            AND seller_id = $2
+            AND is_sold = FALSE
+          RETURNING id, title, is_sold, sold_at
+        `,
+        [listingId, req.user.id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Listing not found, already sold, or you do not own this listing'
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Listing marked as sold',
+        listing: result.rows[0]
+      });
+    } catch (err) {
+      console.error(
+        'Mark listing as sold error:',
+        err.message
+      );
+
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to mark listing as sold'
+      });
+    }
+  }
+);
 
 /*
   DELETE LISTING
 */
 
 app.delete(
-   '/api/listings/:id',
-   authenticateToken,
-   async (req, res) => {
-
-  const { id } =
-    req.params;
-
-  try {
-
-    const result =
-      await pool.query(
-        `
-          DELETE FROM listings
-
-          WHERE id = $1 AND seller_id = $2
-
-
-          RETURNING *
-        `,
-        [id,req.user.id]
-      );
-
-    if (
-      result.rows.length === 0
-    ) {
-
-      return res.status(404).json({
-        success: false,
-        error:
-          'Listing not found or you are not authorized to delete it'
-      });
-    }
-
-    res.json({
-      success: true,
-      message:
-        'Listing deleted successfully'
-    });
-
-  } catch (err) {
-
-    console.error(
-      'Error deleting listing:',
-      err
-    );
-
-    res.status(500).json({
-      success: false,
-      error:
-        err.message
-    });
-  }
-});
-
-
-/*
-  GET USER LISTINGS
-*/
-
-app.get(
-  '/api/users/:userId/listings',
-   authenticateToken,
+  '/api/listings/:id',
+  authenticateToken,
   async (req, res) => {
-
-    const {
-      userId
-    } = req.params;
-     if (Number(userId) !== Number(req.user.id)) {
-  return res.status(403).json({
-    success: false,
-    error: 'You are not authorized to access this account'
-  });
-}
+    const { id } = req.params;
 
     try {
+      const result = await pool.query(
+        `
+          DELETE FROM listings
+          WHERE id = $1
+            AND seller_id = $2
+          RETURNING *
+        `,
+        [id, req.user.id]
+      );
 
-      const result =
-        await pool.query(
-          `
-            SELECT *
-            FROM listings
-
-            WHERE seller_id = $1
-
-            ORDER BY id DESC
-          `,
-          [userId]
-        );
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Listing not found or you are not authorized to delete it'
+        });
+      }
 
       res.json({
         success: true,
-        listings:
-          result.rows
+        message: 'Listing deleted successfully'
       });
-
     } catch (err) {
-
-      console.error(
-        'Error fetching seller listings:',
-        err
-      );
+      console.error('Error deleting listing:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to delete listing'
       });
     }
   }
 );
 
+/*
+  GET USER LISTINGS
+  Includes sold listings so the seller can see their status.
+*/
+
+app.get(
+  '/api/users/:userId/listings',
+  authenticateToken,
+  async (req, res) => {
+    const { userId } = req.params;
+
+    if (Number(userId) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'You are not authorized to access this account'
+      });
+    }
+
+    try {
+      const result = await pool.query(
+        `
+          SELECT *
+          FROM listings
+          WHERE seller_id = $1
+          ORDER BY id DESC
+        `,
+        [userId]
+      );
+
+      res.json({
+        success: true,
+        listings: result.rows
+      });
+    } catch (err) {
+      console.error('Error fetching seller listings:', err);
+
+      res.status(500).json({
+        success: false,
+        error: 'Unable to fetch seller listings'
+      });
+    }
+  }
+);
 
 /* =========================================================
    CHAT ROUTES
@@ -1047,173 +941,99 @@ app.get(
 
 app.get(
   '/api/chat/conversations/:userId',
-   authenticateToken,
+  authenticateToken,
   async (req, res) => {
+    const { userId } = req.params;
 
-    const {
-      userId
-    } = req.params;
-     if (Number(userId) !== Number(req.user.id)) {
-  return res.status(403).json({
-    success: false,
-    error: 'You are not authorized to access this account'
-  });
-}
+    if (Number(userId) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'You are not authorized to access this account'
+      });
+    }
 
     try {
+      const result = await pool.query(
+        `
+          SELECT
+            u.id AS user_id,
+            u.full_name AS user_name,
+            u.email,
+            u.student_id,
 
-      const result =
-        await pool.query(
-          `
-            SELECT
-
-              u.id AS user_id,
-
-              u.full_name AS user_name,
-
-              u.email,
-
-              u.student_id,
-
-              (
-                SELECT message
-
-                FROM chat_messages
-
-                WHERE
-                  (
-                    sender_id = $1
-                    AND receiver_id = u.id
-                  )
-
-                  OR
-
-                  (
-                    sender_id = u.id
-                    AND receiver_id = $1
-                  )
-
-                ORDER BY created_at DESC
-
-                LIMIT 1
-
-              ) AS last_message,
-
-              (
-                SELECT created_at
-
-                FROM chat_messages
-
-                WHERE
-                  (
-                    sender_id = $1
-                    AND receiver_id = u.id
-                  )
-
-                  OR
-
-                  (
-                    sender_id = u.id
-                    AND receiver_id = $1
-                  )
-
-                ORDER BY created_at DESC
-
-                LIMIT 1
-
-              ) AS last_message_time,
-
-              (
-                SELECT COUNT(*)
-
-                FROM chat_messages
-
-                WHERE
-                  receiver_id = $1
-                  AND sender_id = u.id
-                  AND is_read = FALSE
-
-              ) AS unread_count,
-
-              (
-                SELECT l.title
-
-                FROM chat_messages cm
-
-                JOIN listings l
-                  ON cm.listing_id = l.id
-
-                WHERE
-                  (
-                    cm.sender_id = $1
-                    AND cm.receiver_id = u.id
-                  )
-
-                  OR
-
-                  (
-                    cm.sender_id = u.id
-                    AND cm.receiver_id = $1
-                  )
-
-                ORDER BY cm.created_at DESC
-
-                LIMIT 1
-
-              ) AS listing_title
-
-            FROM users u
-
-            WHERE u.id IN (
-
-              SELECT DISTINCT
-
-                CASE
-
-                  WHEN sender_id = $1
-                    THEN receiver_id
-
-                  ELSE sender_id
-
-                END AS other_user
-
+            (
+              SELECT message
               FROM chat_messages
-
               WHERE
-                sender_id = $1
-                OR receiver_id = $1
-            )
+                (sender_id = $1 AND receiver_id = u.id)
+                OR
+                (sender_id = u.id AND receiver_id = $1)
+              ORDER BY created_at DESC
+              LIMIT 1
+            ) AS last_message,
 
-            AND u.id != $1
+            (
+              SELECT created_at
+              FROM chat_messages
+              WHERE
+                (sender_id = $1 AND receiver_id = u.id)
+                OR
+                (sender_id = u.id AND receiver_id = $1)
+              ORDER BY created_at DESC
+              LIMIT 1
+            ) AS last_message_time,
 
-            ORDER BY
-              last_message_time DESC NULLS LAST
-          `,
-          [userId]
-        );
+            (
+              SELECT COUNT(*)
+              FROM chat_messages
+              WHERE
+                receiver_id = $1
+                AND sender_id = u.id
+                AND is_read = FALSE
+            ) AS unread_count,
+
+            (
+              SELECT l.title
+              FROM chat_messages cm
+              JOIN listings l ON cm.listing_id = l.id
+              WHERE
+                (cm.sender_id = $1 AND cm.receiver_id = u.id)
+                OR
+                (cm.sender_id = u.id AND cm.receiver_id = $1)
+              ORDER BY cm.created_at DESC
+              LIMIT 1
+            ) AS listing_title
+
+          FROM users u
+          WHERE u.id IN (
+            SELECT DISTINCT
+              CASE
+                WHEN sender_id = $1 THEN receiver_id
+                ELSE sender_id
+              END AS other_user
+            FROM chat_messages
+            WHERE sender_id = $1 OR receiver_id = $1
+          )
+          AND u.id != $1
+          ORDER BY last_message_time DESC NULLS LAST
+        `,
+        [userId]
+      );
 
       res.json({
         success: true,
-        conversations:
-          result.rows
+        conversations: result.rows
       });
-
     } catch (err) {
-
-      console.error(
-        'Error fetching conversations:',
-        err
-      );
+      console.error('Error fetching conversations:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to fetch conversations'
       });
     }
   }
 );
-
 
 /*
   TOTAL UNREAD
@@ -1221,59 +1041,45 @@ app.get(
 
 app.get(
   '/api/chat/unread/total/:userId',
-   authenticateToken,
+  authenticateToken,
   async (req, res) => {
+    const { userId } = req.params;
 
-    const {
-      userId
-    } = req.params;
-     if (Number(userId) !== Number(req.user.id)) {
-  return res.status(403).json({
-    success: false,
-    error: 'You are not authorized to access this account'
-  });
-}
+    if (Number(userId) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'You are not authorized to access this account'
+      });
+    }
 
     try {
-
-      const result =
-        await pool.query(
-          `
-            SELECT COUNT(*) AS total_unread
-
-            FROM chat_messages
-
-            WHERE
-              receiver_id = $1
-              AND is_read = FALSE
-          `,
-          [userId]
-        );
+      const result = await pool.query(
+        `
+          SELECT COUNT(*) AS total_unread
+          FROM chat_messages
+          WHERE receiver_id = $1
+            AND is_read = FALSE
+        `,
+        [userId]
+      );
 
       res.json({
         success: true,
-        total_unread:
-          parseInt(
-            result.rows[0].total_unread
-          )
+        total_unread: Number.parseInt(
+          result.rows[0].total_unread,
+          10
+        )
       });
-
     } catch (err) {
-
-      console.error(
-        'Error getting unread count:',
-        err
-      );
+      console.error('Error getting unread count:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to get unread count'
       });
     }
   }
 );
-
 
 /*
   MARK MESSAGES AS READ
@@ -1281,59 +1087,43 @@ app.get(
 
 app.put(
   '/api/chat/mark-read/:userId/:otherUserId',
-   authenticateToken,
+  authenticateToken,
   async (req, res) => {
+    const { userId, otherUserId } = req.params;
 
-    const {
-      userId,
-      otherUserId
-    } = req.params;
-     if (Number(userId) !== Number(req.user.id)) {
-  return res.status(403).json({
-    success: false,
-    error: 'You are not authorized to access this account'
-  });
-}
+    if (Number(userId) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'You are not authorized to access this account'
+      });
+    }
 
     try {
-
       await pool.query(
         `
           UPDATE chat_messages
-
           SET is_read = TRUE
-
           WHERE
             receiver_id = $1
             AND sender_id = $2
             AND is_read = FALSE
         `,
-        [
-          userId,
-          otherUserId
-        ]
+        [userId, otherUserId]
       );
 
       res.json({
         success: true
       });
-
     } catch (err) {
-
-      console.error(
-        'Error marking messages as read:',
-        err
-      );
+      console.error('Error marking messages as read:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to mark messages as read'
       });
     }
   }
 );
-
 
 /*
   GET CHAT MESSAGES
@@ -1341,115 +1131,73 @@ app.put(
 
 app.get(
   '/api/chat/messages/:userId/:otherUserId',
-   authenticateToken,
+  authenticateToken,
   async (req, res) => {
+    const { userId, otherUserId } = req.params;
 
-    const {
-      userId,
-      otherUserId
-    } = req.params;
-     if (Number(userId) !== Number(req.user.id)) {
-  return res.status(403).json({
-    success: false,
-    error: 'You are not authorized to access this account'
-  });
-}
-const requestedLimit = Number(req.query.limit ?? 50);
-const requestedOffset = Number(req.query.offset ?? 0);
+    if (Number(userId) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'You are not authorized to access this account'
+      });
+    }
 
-if (
-  !Number.isInteger(requestedLimit) ||
-  requestedLimit < 1 ||
-  !Number.isInteger(requestedOffset) ||
-  requestedOffset < 0
-) {
-  return res.status(400).json({
-    success: false,
-    error: 'Invalid pagination parameters'
-  });
-}
+    const requestedLimit = Number(req.query.limit ?? 50);
+    const requestedOffset = Number(req.query.offset ?? 0);
 
-const limit = Math.min(requestedLimit, 100);
-const offset = requestedOffset;
+    if (
+      !Number.isInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      !Number.isInteger(requestedOffset) ||
+      requestedOffset < 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid pagination parameters'
+      });
+    }
+
+    const limit = Math.min(requestedLimit, 100);
+    const offset = requestedOffset;
+
     try {
-
-      const result =
-        await pool.query(
-          `
-            SELECT
-
-              cm.*,
-
-              u1.full_name AS sender_name,
-
-              u2.full_name AS receiver_name,
-
-              l.title AS listing_title,
-
-              l.id AS listing_id
-
-            FROM chat_messages cm
-
-            LEFT JOIN users u1
-              ON cm.sender_id = u1.id
-
-            LEFT JOIN users u2
-              ON cm.receiver_id = u2.id
-
-            LEFT JOIN listings l
-              ON cm.listing_id = l.id
-
-            WHERE
-
-              (
-                cm.sender_id = $1
-                AND cm.receiver_id = $2
-              )
-
-              OR
-
-              (
-                cm.sender_id = $2
-                AND cm.receiver_id = $1
-              )
-
-            ORDER BY
-              cm.created_at ASC
-
-            LIMIT $3
-
-            OFFSET $4
-          `,
-          [
-            userId,
-            otherUserId,
-            limit,
-            offset
-          ]
-        );
+      const result = await pool.query(
+        `
+          SELECT
+            cm.*,
+            u1.full_name AS sender_name,
+            u2.full_name AS receiver_name,
+            l.title AS listing_title,
+            l.id AS listing_id
+          FROM chat_messages cm
+          LEFT JOIN users u1 ON cm.sender_id = u1.id
+          LEFT JOIN users u2 ON cm.receiver_id = u2.id
+          LEFT JOIN listings l ON cm.listing_id = l.id
+          WHERE
+            (cm.sender_id = $1 AND cm.receiver_id = $2)
+            OR
+            (cm.sender_id = $2 AND cm.receiver_id = $1)
+          ORDER BY cm.created_at ASC
+          LIMIT $3
+          OFFSET $4
+        `,
+        [userId, otherUserId, limit, offset]
+      );
 
       res.json({
         success: true,
-        messages:
-          result.rows
+        messages: result.rows
       });
-
     } catch (err) {
-
-      console.error(
-        'Error fetching chat messages:',
-        err
-      );
+      console.error('Error fetching chat messages:', err);
 
       res.status(500).json({
         success: false,
-        error:
-          err.message
+        error: 'Unable to fetch chat messages'
       });
     }
   }
 );
-
 
 /*
   SEND CHAT MESSAGE
@@ -1499,15 +1247,29 @@ app.post(
         });
       }
 
+      /*
+        If a listing ID is supplied, verify that it exists.
+        Sold listings can still be discussed through existing chats.
+      */
+
+      if (listing_id) {
+        const listingResult = await pool.query(
+          'SELECT id FROM listings WHERE id = $1',
+          [listing_id]
+        );
+
+        if (listingResult.rows.length === 0) {
+          return res.status(404).json({
+            success: false,
+            error: 'Listing not found'
+          });
+        }
+      }
+
       const result = await pool.query(
         `
           INSERT INTO chat_messages
-          (
-            sender_id,
-            receiver_id,
-            listing_id,
-            message
-          )
+            (sender_id, receiver_id, listing_id, message)
           VALUES ($1, $2, $3, $4)
           RETURNING *
         `,
@@ -1536,7 +1298,6 @@ app.post(
             senderResult.rows[0]?.full_name || 'Student'
         }
       });
-
     } catch (err) {
       console.error('Error sending message:', err);
 
@@ -1546,82 +1307,48 @@ app.post(
       });
     }
   }
-
 );
-
 
 /* =========================================================
    HEALTH CHECK
    ========================================================= */
 
-app.get(
-  '/api/health',
-  (req, res) => {
-
-    res.json({
-      status:
-        '✅ Server is running!',
-
-      timestamp:
-        new Date().toISOString(),
-
-      database:
-        process.env.DATABASE_URL
-          ? 'Connected'
-          : 'Not connected'
-    });
-  }
-);
-
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'Server is running!',
+    timestamp: new Date().toISOString(),
+    database: process.env.DATABASE_URL
+      ? 'Configured'
+      : 'Not configured'
+  });
+});
 
 /* =========================================================
    START SERVER
    ========================================================= */
 
-const PORT =
-  process.env.PORT || 5000;
+const PORT = process.env.PORT || 5000;
 
-app.listen(
-  PORT,
-  () => {
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 
-    console.log(
-      `🚀 Server running on port ${PORT}`
-    );
-
-    console.log(
-      `📊 Database: ${
-        process.env.DATABASE_URL
-          ? 'Render PostgreSQL'
-          : 'Local PostgreSQL'
-      }`
-    );
-  }
-);
-
+  console.log(
+    `Database: ${
+      process.env.DATABASE_URL
+        ? 'Configured'
+        : 'Not configured'
+    }`
+  );
+});
 
 /* =========================================================
    ERROR HANDLING
    ========================================================= */
 
-process.on(
-  'uncaughtException',
-  (err) => {
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
 
-    console.error(
-      '❌ Uncaught Exception:',
-      err
-    );
-  }
-);
-
-process.on(
-  'unhandledRejection',
-  (err) => {
-
-    console.error(
-      '❌ Unhandled Rejection:',
-      err
-    );
-  }
-);
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});
