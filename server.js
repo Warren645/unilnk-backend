@@ -1334,13 +1334,23 @@ app.get(
     error: 'You are not authorized to access this account'
   });
 }
+const requestedLimit = Number(req.query.limit ?? 50);
+const requestedOffset = Number(req.query.offset ?? 0);
 
-    const limit =
-      parseInt(req.query.limit) || 50;
+if (
+  !Number.isInteger(requestedLimit) ||
+  requestedLimit < 1 ||
+  !Number.isInteger(requestedOffset) ||
+  requestedOffset < 0
+) {
+  return res.status(400).json({
+    success: false,
+    error: 'Invalid pagination parameters'
+  });
+}
 
-    const offset =
-      parseInt(req.query.offset) || 0;
-
+const limit = Math.min(requestedLimit, 100);
+const offset = requestedOffset;
     try {
 
       const result =
