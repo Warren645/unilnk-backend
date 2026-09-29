@@ -173,6 +173,57 @@ const initializeDatabase = async () => {
       ADD COLUMN IF NOT EXISTS sold_at TIMESTAMP WITHOUT TIME ZONE;
     `);
 
+    /* ================= ADMIN MODERATION ================= */
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'student';
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS moderation_actions (
+        id SERIAL PRIMARY KEY,
+        listing_id INTEGER,
+        listing_title VARCHAR(255),
+        listing_price NUMERIC(10,2),
+        listing_category VARCHAR(100),
+        seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        seller_name VARCHAR(255),
+        admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        admin_name VARCHAR(255),
+        reason VARCHAR(100) NOT NULL,
+        note TEXT,
+        seller_notified BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    /*
+      Promote admins listed in the ADMIN_EMAILS environment variable
+      (comma-separated). Accounts must already be registered.
+    */
+
+    const adminEmails = (process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean);
+
+    if (adminEmails.length > 0) {
+      const promoted = await pool.query(
+        `
+          UPDATE users
+          SET role = 'admin'
+          WHERE LOWER(email) = ANY($1::text[])
+            AND role <> 'admin'
+        `,
+        [adminEmails]
+      );
+
+      if (promoted.rowCount > 0) {
+        console.log(`Promoted ${promoted.rowCount} user(s) to admin.`);
+      }
+    }
+
     console.log(
       'Database tables and sold-listing columns verified successfully.'
     );
@@ -364,7 +415,7 @@ app.post('/api/auth/register', async (req, res) => {
         INSERT INTO users
           (full_name, email, password_hash, student_id)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, full_name, email, student_id
+        RETURNING id, full_name, email, student_id, role
       `,
       [
         full_name.trim(),
@@ -441,7 +492,8 @@ app.post('/api/auth/login', async (req, res) => {
           full_name,
           email,
           password_hash,
-          student_id
+          student_id,
+          role
         FROM users
         WHERE LOWER(email) = $1
       `,
@@ -500,7 +552,8 @@ app.post('/api/auth/login', async (req, res) => {
       id: dbUser.id,
       full_name: dbUser.full_name,
       email: dbUser.email,
-      student_id: dbUser.student_id
+      student_id: dbUser.student_id,
+      role: dbUser.role
     };
 
     const token = jwt.sign(
@@ -872,6 +925,18 @@ app.delete(
     const { id } = req.params;
 
     try {
+      await pool.query(
+        `
+          UPDATE chat_messages
+          SET listing_id = NULL
+          WHERE listing_id IN (
+            SELECT id FROM listings
+            WHERE id = $1 AND seller_id = $2
+          )
+        `,
+        [id, req.user.id]
+      );
+
       const result = await pool.query(
         `
           DELETE FROM listings
@@ -1322,6 +1387,559 @@ app.post(
       res.status(500).json({
         success: false,
         error: 'Failed to send message'
+      });
+    }
+  }
+);
+
+/* =========================================================
+   SESSION
+   ========================================================= */
+
+/*
+  CURRENT USER
+  Lets the frontend refresh the role after a promotion or demotion.
+*/
+
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+        SELECT id, full_name, email, student_id, role
+        FROM users
+        WHERE id = $1
+      `,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Account not found'
+      });
+    }
+
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error('Error fetching current user:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to fetch account'
+    });
+  }
+});
+
+/* =========================================================
+   ADMIN MODERATION
+   ========================================================= */
+
+/*
+  Listings whose title or description contain one of these phrases
+  are surfaced in the admin "Flagged" queue. Flags are only hints for
+  a human to review; nothing is ever removed automatically.
+  Edit this list to match your campus rules.
+*/
+
+const FLAG_KEYWORDS = [
+  // Weapons
+  'gun', 'guns', 'pistol', 'rifle', 'revolver', 'shotgun', 'firearm',
+  'ammo', 'ammunition', 'grenade', 'explosive', 'explosives',
+  // Drugs and alcohol
+  'weed', 'marijuana', 'cannabis', 'mbanje', 'cocaine', 'heroin',
+  'meth', 'ecstasy', 'lsd', 'alcohol', 'vodka', 'whisky', 'whiskey',
+  // Academic dishonesty
+  'leaked exam', 'exam leak', 'exam answers', 'leaked paper',
+  'write your assignment', 'do your assignment', 'assignment writing',
+  'essay writing', 'ghostwriting',
+  // Fakes and stolen goods
+  'fake id', 'fake certificate', 'fake degree', 'counterfeit',
+  'forged', 'forgery', 'stolen',
+  // Adult content
+  'porn', 'nude', 'nudes', 'escort'
+];
+
+const escapeRegex = (text) =>
+  text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+');
+
+const SORTED_FLAG_KEYWORDS = [...FLAG_KEYWORDS].sort(
+  (a, b) => b.length - a.length
+);
+
+// PostgreSQL pattern (\m and \M mark word boundaries)
+const FLAG_SQL_PATTERN =
+  '\\m(?:' + SORTED_FLAG_KEYWORDS.map(escapeRegex).join('|') + ')\\M';
+
+// JavaScript pattern used to report which terms matched
+const FLAG_JS_PATTERN = new RegExp(
+  '\\b(?:' + SORTED_FLAG_KEYWORDS.map(escapeRegex).join('|') + ')\\b',
+  'gi'
+);
+
+const findFlaggedTerms = (title, description) => {
+  const text = `${title || ''} ${description || ''}`;
+  const matches = text.match(FLAG_JS_PATTERN) || [];
+
+  return [
+    ...new Set(matches.map((m) => m.toLowerCase().replace(/\s+/g, ' ')))
+  ];
+};
+
+const REMOVAL_REASONS = [
+  'Weapons',
+  'Drugs or alcohol',
+  'Academic dishonesty',
+  'Fake or counterfeit items',
+  'Stolen goods',
+  'Adult or inappropriate content',
+  'Scam or misleading',
+  'Spam or duplicate',
+  'Other prohibited item'
+];
+
+const FLAGGED_SQL = `
+  (
+    NOT l.is_sold
+    AND (COALESCE(l.title, '') || ' ' || COALESCE(l.description, ''))
+        ~* $1
+  )
+`;
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, full_name, role FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0 || result.rows[0].role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Administrator access required'
+      });
+    }
+
+    req.admin = result.rows[0];
+
+    next();
+  } catch (err) {
+    console.error('Admin check error:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to verify administrator access'
+    });
+  }
+};
+
+const parseImageUrls = (imageUrl) => {
+  if (!imageUrl) return [];
+
+  try {
+    if (typeof imageUrl === 'string' && imageUrl.startsWith('[')) {
+      const parsed = JSON.parse(imageUrl);
+      return Array.isArray(parsed) ? parsed : [];
+    }
+  } catch {
+    return [];
+  }
+
+  return [imageUrl];
+};
+
+const deleteCloudinaryImages = async (imageUrl) => {
+  const urls = parseImageUrls(imageUrl);
+
+  for (const url of urls) {
+    const match = String(url).match(/\/upload\/(?:v\d+\/)?(.+)\.[a-z0-9]+$/i);
+    const publicId = match ? decodeURIComponent(match[1]) : null;
+
+    if (!publicId || !publicId.startsWith('unilnk_listings/')) continue;
+
+    try {
+      await cloudinary.uploader.destroy(publicId);
+    } catch (err) {
+      console.error('Cloudinary cleanup failed:', err.message);
+    }
+  }
+};
+
+const parsePagination = (query, defaultLimit, maxLimit) => {
+  const page = Math.max(Number.parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(
+    Math.max(Number.parseInt(query.limit, 10) || defaultLimit, 1),
+    maxLimit
+  );
+
+  return { page, limit, offset: (page - 1) * limit };
+};
+
+/*
+  MODERATION OVERVIEW
+*/
+
+app.get(
+  '/api/admin/stats',
+  authenticateToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+          SELECT
+            (SELECT COUNT(*)::int FROM users) AS total_users,
+            (SELECT COUNT(*)::int FROM listings WHERE is_sold = FALSE)
+              AS active_listings,
+            (SELECT COUNT(*)::int FROM listings WHERE is_sold = TRUE)
+              AS sold_listings,
+            (
+              SELECT COUNT(*)::int
+              FROM listings l
+              WHERE ${FLAGGED_SQL}
+            ) AS flagged_listings,
+            (
+              SELECT COUNT(*)::int
+              FROM moderation_actions
+              WHERE created_at >= NOW() - INTERVAL '7 days'
+            ) AS removed_7d,
+            (SELECT COUNT(*)::int FROM moderation_actions)
+              AS removed_total
+        `,
+        [FLAG_SQL_PATTERN]
+      );
+
+      res.json({ success: true, stats: result.rows[0] });
+    } catch (err) {
+      console.error('Error fetching admin stats:', err);
+
+      res.status(500).json({
+        success: false,
+        error: 'Unable to fetch moderation overview'
+      });
+    }
+  }
+);
+
+/*
+  LIST LISTINGS FOR MODERATION
+  Query: search, status (all | active | sold | flagged),
+         category, campus, page, limit
+*/
+
+app.get(
+  '/api/admin/listings',
+  authenticateToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { search, status, category, campus } = req.query;
+      const { page, limit, offset } = parsePagination(req.query, 12, 50);
+
+      const params = [FLAG_SQL_PATTERN];
+      const conditions = [];
+
+      if (status === 'active') {
+        conditions.push('l.is_sold = FALSE');
+      } else if (status === 'sold') {
+        conditions.push('l.is_sold = TRUE');
+      } else if (status === 'flagged') {
+        conditions.push(FLAGGED_SQL);
+      }
+
+      if (category && category !== 'All') {
+        params.push(category);
+        conditions.push(`l.category = $${params.length}`);
+      }
+
+      if (campus && campus !== 'All') {
+        params.push(campus);
+        conditions.push(`l.campus = $${params.length}`);
+      }
+
+      if (search && String(search).trim()) {
+        params.push(`%${String(search).trim()}%`);
+        const i = params.length;
+
+        conditions.push(`(
+          l.title ILIKE $${i}
+          OR l.description ILIKE $${i}
+          OR u.full_name ILIKE $${i}
+          OR u.email ILIKE $${i}
+          OR u.student_id ILIKE $${i}
+        )`);
+      }
+
+      const where =
+        conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+      const baseQuery = `
+        SELECT
+          l.id,
+          l.title,
+          l.description,
+          l.price,
+          l.quantity,
+          l.category,
+          l.campus,
+          l.image_url,
+          l.created_at,
+          l.is_sold,
+          l.sold_at,
+          l.seller_id,
+          COALESCE(u.full_name, l.seller_name) AS seller_name,
+          u.email AS seller_email,
+          u.student_id AS seller_student_id,
+          (
+            SELECT COUNT(*)::int
+            FROM moderation_actions m
+            WHERE m.seller_id = l.seller_id
+          ) AS seller_prior_removals,
+          ${FLAGGED_SQL} AS is_flagged
+        FROM listings l
+        LEFT JOIN users u ON u.id = l.seller_id
+        ${where}
+      `;
+
+      const totalResult = await pool.query(
+        `SELECT COUNT(*)::int AS total FROM (${baseQuery}) counted`,
+        params
+      );
+
+      const listingsResult = await pool.query(
+        `
+          ${baseQuery}
+          ORDER BY is_flagged DESC, l.id DESC
+          LIMIT $${params.length + 1}
+          OFFSET $${params.length + 2}
+        `,
+        [...params, limit, offset]
+      );
+
+      const listings = listingsResult.rows.map((row) => ({
+        ...row,
+        flagged_terms: row.is_flagged
+          ? findFlaggedTerms(row.title, row.description)
+          : []
+      }));
+
+      const total = totalResult.rows[0].total;
+
+      res.json({
+        success: true,
+        listings,
+        pagination: {
+          page,
+          limit,
+          total,
+          total_pages: Math.max(Math.ceil(total / limit), 1)
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching admin listings:', err);
+
+      res.status(500).json({
+        success: false,
+        error: 'Unable to fetch listings for moderation'
+      });
+    }
+  }
+);
+
+/*
+  REMOVE A PROHIBITED LISTING
+  Body: { reason, note?, notify_seller? }
+*/
+
+app.delete(
+  '/api/admin/listings/:id',
+  authenticateToken,
+  requireAdmin,
+  async (req, res) => {
+    const listingId = Number(req.params.id);
+
+    if (!Number.isInteger(listingId) || listingId < 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid listing ID'
+      });
+    }
+
+    const { reason } = req.body || {};
+
+    if (!REMOVAL_REASONS.includes(reason)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please choose a valid removal reason'
+      });
+    }
+
+    const note = String(req.body.note || '').trim().slice(0, 500);
+    const notifySeller = req.body.notify_seller !== false;
+
+    let client;
+    let removedImages = null;
+
+    try {
+      client = await pool.connect();
+      await client.query('BEGIN');
+
+      const found = await client.query(
+        `
+          SELECT id, title, price, category, seller_id, seller_name, image_url
+          FROM listings
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        [listingId]
+      );
+
+      if (found.rows.length === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(404).json({
+          success: false,
+          error: 'Listing not found. It may already have been removed.'
+        });
+      }
+
+      const listing = found.rows[0];
+      removedImages = listing.image_url;
+
+      const canNotify =
+        notifySeller &&
+        listing.seller_id &&
+        Number(listing.seller_id) !== Number(req.admin.id);
+
+      // Keep chat history but detach it from the removed listing.
+      await client.query(
+        'UPDATE chat_messages SET listing_id = NULL WHERE listing_id = $1',
+        [listingId]
+      );
+
+      await client.query('DELETE FROM listings WHERE id = $1', [listingId]);
+
+      await client.query(
+        `
+          INSERT INTO moderation_actions
+            (
+              listing_id, listing_title, listing_price, listing_category,
+              seller_id, seller_name, admin_id, admin_name,
+              reason, note, seller_notified
+            )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `,
+        [
+          listing.id,
+          listing.title,
+          listing.price,
+          listing.category,
+          listing.seller_id,
+          listing.seller_name,
+          req.admin.id,
+          req.admin.full_name,
+          reason,
+          note || null,
+          Boolean(canNotify)
+        ]
+      );
+
+      if (canNotify) {
+        const message =
+          `Your listing "${listing.title}" was removed by UniLnk ` +
+          `moderators because it breaks the marketplace rules ` +
+          `(${reason}).` +
+          (note ? ` Moderator note: ${note}` : '') +
+          ' If you think this was a mistake, reply here.';
+
+        await client.query(
+          `
+            INSERT INTO chat_messages
+              (sender_id, receiver_id, listing_id, message)
+            VALUES ($1, $2, NULL, $3)
+          `,
+          [req.admin.id, listing.seller_id, message]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      // Remove the hosted photos too. Failures here are only logged.
+      deleteCloudinaryImages(removedImages);
+
+      res.json({
+        success: true,
+        message: 'Listing removed',
+        seller_notified: Boolean(canNotify)
+      });
+    } catch (err) {
+      if (client) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          console.error('Moderation rollback error:', rollbackError.message);
+        }
+      }
+
+      console.error('Error removing listing:', err);
+
+      res.status(500).json({
+        success: false,
+        error: 'Unable to remove listing'
+      });
+    } finally {
+      if (client) {
+        client.release();
+      }
+    }
+  }
+);
+
+/*
+  MODERATION LOG
+*/
+
+app.get(
+  '/api/admin/moderation-log',
+  authenticateToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { page, limit, offset } = parsePagination(req.query, 15, 50);
+
+      const [totalResult, logResult] = await Promise.all([
+        pool.query('SELECT COUNT(*)::int AS total FROM moderation_actions'),
+        pool.query(
+          `
+            SELECT
+              id, listing_id, listing_title, listing_price,
+              listing_category, seller_id, seller_name, admin_name,
+              reason, note, seller_notified, created_at
+            FROM moderation_actions
+            ORDER BY id DESC
+            LIMIT $1 OFFSET $2
+          `,
+          [limit, offset]
+        )
+      ]);
+
+      const total = totalResult.rows[0].total;
+
+      res.json({
+        success: true,
+        entries: logResult.rows,
+        pagination: {
+          page,
+          limit,
+          total,
+          total_pages: Math.max(Math.ceil(total / limit), 1)
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching moderation log:', err);
+
+      res.status(500).json({
+        success: false,
+        error: 'Unable to fetch moderation log'
       });
     }
   }
