@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -282,6 +281,23 @@ initializeDatabase()
    ========================================================= */
 
 /*
+  PASSWORD POLICY (registration only - login must not enforce it,
+  so existing users with older passwords can still sign in)
+*/
+
+const validatePassword = (password) => {
+  if (typeof password !== 'string') return 'Invalid password';
+  if (password.length < 8) return 'Password must be at least 8 characters long';
+  // bcrypt only uses the first 72 bytes
+  if (Buffer.byteLength(password, 'utf8') > 72) return 'Password must be 72 characters or fewer';
+  if (!/[A-Z]/.test(password)) return 'Password must include an uppercase letter';
+  if (!/[a-z]/.test(password)) return 'Password must include a lowercase letter';
+  if (!/\d/.test(password)) return 'Password must include a number';
+  if (!/[^A-Za-z0-9]/.test(password)) return 'Password must include a special character';
+  return null;
+};
+
+/*
   REGISTER
   POST /api/auth/register
 */
@@ -306,10 +322,12 @@ app.post('/api/auth/register', async (req, res) => {
     });
   }
 
-  if (password.length < 6) {
+  const passwordError = validatePassword(password);
+
+  if (passwordError) {
     return res.status(400).json({
       success: false,
-      error: 'Password must be at least 6 characters long'
+      error: passwordError
     });
   }
 
