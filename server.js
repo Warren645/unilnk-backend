@@ -6,9 +6,13 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
+
+// Needed on Render/Vercel so req.ip is the real client IP (used for rate limiting)
+app.set('trust proxy', 1);
 
 /* =========================================================
    SERVER CONFIGURATION
@@ -119,6 +123,24 @@ const initializeDatabase = async () => {
         student_id VARCHAR(100),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    /* ================= PASSWORD RESETS ================= */
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_password_resets_token_hash
+      ON password_resets(token_hash);
     `);
 
     /* ================= LISTINGS ================= */
@@ -457,6 +479,285 @@ app.post('/api/auth/register', async (req, res) => {
       success: false,
       error: 'Unable to create account'
     });
+  }
+});
+
+/*
+  PASSWORD RESET
+  POST /api/auth/forgot-password  -> emails a single-use link (valid 30 min)
+  POST /api/auth/reset-password   -> sets a new password using that link
+*/
+
+const RESET_TOKEN_TTL_MINUTES = 30;
+const FRONTEND_URL = (
+  process.env.FRONTEND_URL || 'https://unilnk.vercel.app'
+).replace(/\/$/, '');
+
+const hashResetToken = (token) =>
+  crypto.createHash('sha256').update(token).digest('hex');
+
+const escapeHtml = (str = '') =>
+  String(str).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]));
+
+// Small in-memory limiter (per server instance). Fine for one Render instance.
+const rateBuckets = new Map();
+
+const isRateLimited = (key, max, windowMs) => {
+  const now = Date.now();
+  const recent = (rateBuckets.get(key) || []).filter(
+    (ts) => now - ts < windowMs
+  );
+
+  if (recent.length >= max) {
+    rateBuckets.set(key, recent);
+    return true;
+  }
+
+  recent.push(now);
+  rateBuckets.set(key, recent);
+  return false;
+};
+
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [key, stamps] of rateBuckets) {
+    if (stamps.every((ts) => ts < cutoff)) rateBuckets.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
+// Sends through Brevo's HTTPS API (no SMTP port needed, which some hosts block)
+const sendResetEmail = async (toEmail, fullName, link) => {
+  if (!process.env.BREVO_API_KEY || !process.env.MAIL_FROM) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[DEV] Password reset link for ${toEmail}: ${link}`);
+    } else {
+      console.warn(
+        'Password reset email not sent: BREVO_API_KEY / MAIL_FROM are not set'
+      );
+    }
+    return;
+  }
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify({
+      sender: { name: 'UniLnk', email: process.env.MAIL_FROM },
+      to: [{ email: toEmail }],
+      subject: 'Reset your UniLnk password',
+      htmlContent: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;">
+          <h2>Reset your password</h2>
+          <p>Hi ${escapeHtml(fullName) || 'there'},</p>
+          <p>We received a request to reset your UniLnk password.
+             This link works once and expires in ${RESET_TOKEN_TTL_MINUTES} minutes.</p>
+          <p>
+            <a href="${link}"
+               style="background:#006633;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;display:inline-block;">
+              Reset password
+            </a>
+          </p>
+          <p style="color:#666;font-size:13px;">
+            If you didn't ask for this, ignore this email - your password won't change.
+          </p>
+        </div>
+      `
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Email provider responded ${response.status}: ${await response.text()}`
+    );
+  }
+};
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = req.body?.email;
+
+  if (typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: 'Email is required'
+    });
+  }
+
+  if (isRateLimited(`forgot:${req.ip}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many requests. Please try again later.'
+    });
+  }
+
+  // Same reply whether or not the account exists (prevents email enumeration)
+  const genericReply = {
+    success: true,
+    message:
+      'If an account exists for that email, a reset link has been sent.'
+  };
+
+  try {
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const result = await pool.query(
+      `SELECT id, full_name, email FROM users WHERE LOWER(email) = $1`,
+      [normalizedEmail]
+    );
+
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+
+      const recent = await pool.query(
+        `
+          SELECT COUNT(*)::int AS n
+          FROM password_resets
+          WHERE user_id = $1
+            AND created_at > NOW() - INTERVAL '15 minutes'
+        `,
+        [user.id]
+      );
+
+      if (recent.rows[0].n < 3) {
+        const token = crypto.randomBytes(32).toString('hex');
+
+        // Only the newest link works
+        await pool.query(
+          `
+            UPDATE password_resets
+            SET used_at = NOW()
+            WHERE user_id = $1 AND used_at IS NULL
+          `,
+          [user.id]
+        );
+
+        await pool.query(
+          `
+            INSERT INTO password_resets (user_id, token_hash, expires_at)
+            VALUES ($1, $2, NOW() + make_interval(mins => $3))
+          `,
+          [user.id, hashResetToken(token), RESET_TOKEN_TTL_MINUTES]
+        );
+
+        await pool.query(
+          `DELETE FROM password_resets WHERE expires_at < NOW() - INTERVAL '1 day'`
+        );
+
+        const link = `${FRONTEND_URL}/?reset_token=${token}`;
+
+        // Not awaited, so response time doesn't reveal whether the email exists
+        sendResetEmail(user.email, user.full_name, link).catch((err) =>
+          console.error('Reset email error:', err.message)
+        );
+      }
+    }
+
+    res.json(genericReply);
+  } catch (err) {
+    console.error('Forgot password error:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to process request'
+    });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body || {};
+
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(400).json({
+      success: false,
+      error: 'This reset link is invalid or has expired'
+    });
+  }
+
+  if (isRateLimited(`reset:${req.ip}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many attempts. Please try again later.'
+    });
+  }
+
+  const passwordError = validatePassword(password);
+
+  if (passwordError) {
+    return res.status(400).json({
+      success: false,
+      error: passwordError
+    });
+  }
+
+  let client;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const found = await client.query(
+      `
+        SELECT id, user_id
+        FROM password_resets
+        WHERE token_hash = $1
+          AND used_at IS NULL
+          AND expires_at > NOW()
+        FOR UPDATE
+      `,
+      [hashResetToken(token)]
+    );
+
+    if (found.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        success: false,
+        error: 'This reset link is invalid or has expired'
+      });
+    }
+
+    const { user_id: userId } = found.rows[0];
+    const newHash = await bcrypt.hash(password, 12);
+
+    await client.query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      [newHash, userId]
+    );
+
+    await client.query(
+      `
+        UPDATE password_resets
+        SET used_at = NOW()
+        WHERE user_id = $1 AND used_at IS NULL
+      `,
+      [userId]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      message: 'Password updated. You can now sign in.'
+    });
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('Reset password error:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to reset password'
+    });
+  } finally {
+    if (client) client.release();
   }
 });
 
