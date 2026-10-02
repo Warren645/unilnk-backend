@@ -195,6 +195,41 @@ const initializeDatabase = async () => {
       ADD COLUMN IF NOT EXISTS sold_at TIMESTAMP WITHOUT TIME ZONE;
     `);
 
+    /* ================= EMAIL VERIFICATION ================= */
+
+    // Existing accounts (created before this feature) count as verified;
+    // new signups default to unverified.
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE;
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ALTER COLUMN email_verified SET DEFAULT FALSE;
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS email_verifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_verifications_token_hash
+      ON email_verifications(token_hash);
+    `);
+
     /* ================= ADMIN MODERATION ================= */
 
     await pool.query(`
@@ -416,54 +451,74 @@ app.post('/api/auth/register', async (req, res) => {
 
     const existingUser = await pool.query(
       `
-        SELECT id
+        SELECT id, email_verified
         FROM users
         WHERE LOWER(email) = $1
       `,
       [normalizedEmail]
     );
 
+    const passwordHash = await bcrypt.hash(password, 12);
+    let user;
+
     if (existingUser.rows.length > 0) {
-      return res.status(409).json({
-        success: false,
-        error: 'An account with this email already exists'
-      });
+      if (existingUser.rows[0].email_verified) {
+        return res.status(409).json({
+          success: false,
+          error: 'An account with this email already exists'
+        });
+      }
+
+      /*
+        An unverified account can't be used to sign in, so the real owner of
+        the email is allowed to register again and take it over.
+      */
+      const updated = await pool.query(
+        `
+          UPDATE users
+          SET full_name = $1, password_hash = $2, student_id = $3
+          WHERE id = $4
+          RETURNING id, full_name, email
+        `,
+        [
+          full_name.trim(),
+          passwordHash,
+          student_id.trim(),
+          existingUser.rows[0].id
+        ]
+      );
+
+      user = updated.rows[0];
+    } else {
+      const result = await pool.query(
+        `
+          INSERT INTO users
+            (full_name, email, password_hash, student_id)
+          VALUES ($1, $2, $3, $4)
+          RETURNING id, full_name, email
+        `,
+        [
+          full_name.trim(),
+          normalizedEmail,
+          passwordHash,
+          student_id.trim()
+        ]
+      );
+
+      user = result.rows[0];
     }
 
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = await pool.query(
-      `
-        INSERT INTO users
-          (full_name, email, password_hash, student_id)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, full_name, email, student_id, role
-      `,
-      [
-        full_name.trim(),
-        normalizedEmail,
-        passwordHash,
-        student_id.trim()
-      ]
-    );
-
-    const user = result.rows[0];
-
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: '7d'
-      }
-    );
+    // No login token here - the user must verify their email first
+    try {
+      await issueVerificationEmail(user);
+    } catch (mailErr) {
+      console.error('Verification setup error:', mailErr);
+    }
 
     res.status(201).json({
       success: true,
-      user,
-      token
+      requires_verification: true,
+      message: 'Account created. Check your email to verify it.'
     });
   } catch (err) {
     console.error('Registration error:', err);
@@ -532,13 +587,13 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref();
 
 // Sends through Brevo's HTTPS API (no SMTP port needed, which some hosts block)
-const sendResetEmail = async (toEmail, fullName, link) => {
+const sendMail = async ({ to, subject, html, devLabel, devLink }) => {
   if (!process.env.BREVO_API_KEY || !process.env.MAIL_FROM) {
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[DEV] Password reset link for ${toEmail}: ${link}`);
+      console.log(`[DEV] ${devLabel} for ${to}: ${devLink}`);
     } else {
       console.warn(
-        'Password reset email not sent: BREVO_API_KEY / MAIL_FROM are not set'
+        `${devLabel} email not sent: BREVO_API_KEY / MAIL_FROM are not set`
       );
     }
     return;
@@ -553,25 +608,9 @@ const sendResetEmail = async (toEmail, fullName, link) => {
     },
     body: JSON.stringify({
       sender: { name: 'UniLnk', email: process.env.MAIL_FROM },
-      to: [{ email: toEmail }],
-      subject: 'Reset your UniLnk password',
-      htmlContent: `
-        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;">
-          <h2>Reset your password</h2>
-          <p>Hi ${escapeHtml(fullName) || 'there'},</p>
-          <p>We received a request to reset your UniLnk password.
-             This link works once and expires in ${RESET_TOKEN_TTL_MINUTES} minutes.</p>
-          <p>
-            <a href="${link}"
-               style="background:#006633;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;display:inline-block;">
-              Reset password
-            </a>
-          </p>
-          <p style="color:#666;font-size:13px;">
-            If you didn't ask for this, ignore this email - your password won't change.
-          </p>
-        </div>
-      `
+      to: [{ email: to }],
+      subject,
+      htmlContent: html
     })
   });
 
@@ -581,6 +620,34 @@ const sendResetEmail = async (toEmail, fullName, link) => {
     );
   }
 };
+
+const emailButton = (link, label) => `
+  <p>
+    <a href="${link}"
+       style="background:#006633;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;display:inline-block;">
+      ${label}
+    </a>
+  </p>`;
+
+const sendResetEmail = (toEmail, fullName, link) =>
+  sendMail({
+    to: toEmail,
+    subject: 'Reset your UniLnk password',
+    devLabel: 'Password reset link',
+    devLink: link,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;">
+        <h2>Reset your password</h2>
+        <p>Hi ${escapeHtml(fullName) || 'there'},</p>
+        <p>We received a request to reset your UniLnk password.
+           This link works once and expires in ${RESET_TOKEN_TTL_MINUTES} minutes.</p>
+        ${emailButton(link, 'Reset password')}
+        <p style="color:#666;font-size:13px;">
+          If you didn't ask for this, ignore this email - your password won't change.
+        </p>
+      </div>
+    `
+  });
 
 app.post('/api/auth/forgot-password', async (req, res) => {
   const email = req.body?.email;
@@ -729,7 +796,13 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const newHash = await bcrypt.hash(password, 12);
 
     await client.query(
-      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      `
+        UPDATE users
+        SET password_hash = $1,
+            email_verified = TRUE,
+            email_verified_at = COALESCE(email_verified_at, NOW())
+        WHERE id = $2
+      `,
       [newHash, userId]
     );
 
@@ -758,6 +831,209 @@ app.post('/api/auth/reset-password', async (req, res) => {
     });
   } finally {
     if (client) client.release();
+  }
+});
+
+/*
+  EMAIL VERIFICATION
+  POST /api/auth/verify-email
+  POST /api/auth/resend-verification
+*/
+
+const VERIFY_TOKEN_TTL_HOURS = 24;
+
+const issueVerificationEmail = async (user) => {
+  const token = crypto.randomBytes(32).toString('hex');
+
+  // Only the newest link works
+  await pool.query(
+    `
+      UPDATE email_verifications
+      SET used_at = NOW()
+      WHERE user_id = $1 AND used_at IS NULL
+    `,
+    [user.id]
+  );
+
+  await pool.query(
+    `
+      INSERT INTO email_verifications (user_id, token_hash, expires_at)
+      VALUES ($1, $2, NOW() + make_interval(hours => $3))
+    `,
+    [user.id, hashResetToken(token), VERIFY_TOKEN_TTL_HOURS]
+  );
+
+  await pool.query(
+    `DELETE FROM email_verifications WHERE expires_at < NOW() - INTERVAL '7 days'`
+  );
+
+  const link = `${FRONTEND_URL}/?verify_token=${token}`;
+
+  // Not awaited, so the response doesn't depend on the email provider
+  sendMail({
+    to: user.email,
+    subject: 'Verify your UniLnk email',
+    devLabel: 'Email verification link',
+    devLink: link,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;">
+        <h2>Verify your email</h2>
+        <p>Hi ${escapeHtml(user.full_name) || 'there'},</p>
+        <p>Welcome to UniLnk! Confirm this is your email address to activate
+           your account. The link expires in ${VERIFY_TOKEN_TTL_HOURS} hours.</p>
+        ${emailButton(link, 'Verify email')}
+        <p style="color:#666;font-size:13px;">
+          If you didn't create a UniLnk account, you can ignore this email.
+        </p>
+      </div>
+    `
+  }).catch((err) => console.error('Verification email error:', err.message));
+};
+
+app.post('/api/auth/verify-email', async (req, res) => {
+  const { token } = req.body || {};
+
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(400).json({
+      success: false,
+      error: 'This verification link is invalid or has expired'
+    });
+  }
+
+  if (isRateLimited(`verify:${req.ip}`, 20, 15 * 60 * 1000)) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many attempts. Please try again later.'
+    });
+  }
+
+  let client;
+
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const found = await client.query(
+      `
+        SELECT id, user_id
+        FROM email_verifications
+        WHERE token_hash = $1
+          AND used_at IS NULL
+          AND expires_at > NOW()
+        FOR UPDATE
+      `,
+      [hashResetToken(token)]
+    );
+
+    if (found.rows.length === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(400).json({
+        success: false,
+        error:
+          'This verification link is invalid or has expired. If you already verified, just sign in.'
+      });
+    }
+
+    const { user_id: userId } = found.rows[0];
+
+    await client.query(
+      `
+        UPDATE users
+        SET email_verified = TRUE, email_verified_at = NOW()
+        WHERE id = $1
+      `,
+      [userId]
+    );
+
+    await client.query(
+      `
+        UPDATE email_verifications
+        SET used_at = NOW()
+        WHERE user_id = $1 AND used_at IS NULL
+      `,
+      [userId]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      message: 'Email verified. You can now sign in.'
+    });
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('Verify email error:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to verify email'
+    });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.post('/api/auth/resend-verification', async (req, res) => {
+  const email = req.body?.email;
+
+  if (typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({
+      success: false,
+      error: 'Email is required'
+    });
+  }
+
+  if (isRateLimited(`resend:${req.ip}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({
+      success: false,
+      error: 'Too many requests. Please try again later.'
+    });
+  }
+
+  // Same reply whether or not the account exists
+  const genericReply = {
+    success: true,
+    message:
+      'If that account needs verification, a new link has been sent.'
+  };
+
+  try {
+    const result = await pool.query(
+      `
+        SELECT id, full_name, email
+        FROM users
+        WHERE LOWER(email) = $1 AND email_verified = FALSE
+      `,
+      [email.trim().toLowerCase()]
+    );
+
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+
+      const recent = await pool.query(
+        `
+          SELECT COUNT(*)::int AS n
+          FROM email_verifications
+          WHERE user_id = $1
+            AND created_at > NOW() - INTERVAL '15 minutes'
+        `,
+        [user.id]
+      );
+
+      if (recent.rows[0].n < 3) {
+        await issueVerificationEmail(user);
+      }
+    }
+
+    res.json(genericReply);
+  } catch (err) {
+    console.error('Resend verification error:', err);
+
+    res.status(500).json({
+      success: false,
+      error: 'Unable to process request'
+    });
   }
 });
 
@@ -794,7 +1070,8 @@ app.post('/api/auth/login', async (req, res) => {
           email,
           password_hash,
           student_id,
-          role
+          role,
+          email_verified
         FROM users
         WHERE LOWER(email) = $1
       `,
@@ -846,6 +1123,15 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password'
+      });
+    }
+
+    // Checked only after the password is right, so it can't be used to probe emails
+    if (!dbUser.email_verified) {
+      return res.status(403).json({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        error: 'Please verify your email before signing in.'
       });
     }
 
