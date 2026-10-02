@@ -53,6 +53,175 @@ app.use(
 app.use(express.json());
 
 /* =========================================================
+   RATE LIMITING
+   In-memory (per server instance), which is fine for a single Render
+   instance. Limits reset when the server restarts. If you ever run several
+   instances, move this to Redis.
+
+   NOTE: many students share one campus Wi-Fi IP, so per-IP limits are
+   deliberately generous; per-user limits are used wherever a login exists.
+   ========================================================= */
+
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+
+const RATE_LIMITS = {
+  generalUser: { max: 1500, windowMs: 15 * MINUTE }, // all API calls, logged in
+  generalAnon: { max: 3000, windowMs: 15 * MINUTE }, // all API calls, per IP
+  loginIp: { max: 50, windowMs: 15 * MINUTE },       // login attempts per IP
+  loginFail: { max: 8, windowMs: 15 * MINUTE },      // wrong passwords per email+IP
+  registerIp: { max: 20, windowMs: HOUR },           // sign-ups per IP
+  listingCreate: { max: 20, windowMs: HOUR },        // new listings per user
+  chatSend: { max: 60, windowMs: MINUTE }            // chat messages per user
+};
+
+const rateStore = new Map();
+
+const rateCheck = (key, max, windowMs, { consume = true } = {}) => {
+  const now = Date.now();
+  const recent = (rateStore.get(key) || []).filter(
+    (ts) => now - ts < windowMs
+  );
+
+  if (recent.length >= max) {
+    rateStore.set(key, recent);
+
+    return {
+      limited: true,
+      retryAfter: Math.max(1, Math.ceil((recent[0] + windowMs - now) / 1000))
+    };
+  }
+
+  if (consume) recent.push(now);
+  rateStore.set(key, recent);
+
+  return { limited: false, remaining: max - recent.length };
+};
+
+// Records an event (e.g. a failed login) without checking the limit
+const rateHit = (key) => {
+  const stamps = rateStore.get(key) || [];
+  stamps.push(Date.now());
+  rateStore.set(key, stamps);
+};
+
+const rateReset = (key) => rateStore.delete(key);
+
+// Used by the password reset / verification routes
+const isRateLimited = (key, max, windowMs) =>
+  rateCheck(key, max, windowMs).limited;
+
+setInterval(() => {
+  const cutoff = Date.now() - HOUR; // longest window is 1 hour
+  for (const [key, stamps] of rateStore) {
+    if (stamps.every((ts) => ts < cutoff)) rateStore.delete(key);
+  }
+}, 10 * MINUTE).unref();
+
+const formatWait = (seconds) =>
+  seconds < 60
+    ? `${seconds} second${seconds === 1 ? '' : 's'}`
+    : `${Math.ceil(seconds / 60)} minute${Math.ceil(seconds / 60) === 1 ? '' : 's'}`;
+
+// Logged-in users are counted per account, everyone else per IP
+const clientKey = (req) => {
+  const header = req.headers.authorization;
+
+  if (header && header.startsWith('Bearer ') && process.env.JWT_SECRET) {
+    try {
+      const decoded = jwt.verify(header.split(' ')[1], process.env.JWT_SECRET);
+      return `u:${decoded.id}`;
+    } catch (err) {
+      /* invalid token: fall through to IP */
+    }
+  }
+
+  return `ip:${req.ip}`;
+};
+
+const limiter =
+  ({ name, max, windowMs, key = (req) => req.ip, skip, message }) =>
+  (req, res, next) => {
+    if (skip && skip(req)) return next();
+
+    const k = key(req);
+    const limit = typeof max === 'function' ? max(k) : max;
+    const result = rateCheck(`${name}:${k}`, limit, windowMs);
+
+    res.set('RateLimit-Limit', String(limit));
+
+    if (result.limited) {
+      res.set('Retry-After', String(result.retryAfter));
+
+      return res.status(429).json({
+        success: false,
+        error:
+          message ||
+          `Too many requests. Please try again in ${formatWait(result.retryAfter)}.`,
+        retry_after: result.retryAfter
+      });
+    }
+
+    res.set('RateLimit-Remaining', String(result.remaining));
+    next();
+  };
+
+// Backstop for every API call (health check excluded)
+app.use(
+  '/api',
+  limiter({
+    name: 'api',
+    key: clientKey,
+    max: (k) =>
+      k.startsWith('u:')
+        ? RATE_LIMITS.generalUser.max
+        : RATE_LIMITS.generalAnon.max,
+    windowMs: RATE_LIMITS.generalUser.windowMs,
+    skip: (req) => req.path === '/health'
+  })
+);
+
+// Stricter limits on sensitive routes (run before the route handlers below)
+app.post(
+  '/api/auth/login',
+  limiter({
+    name: 'login-ip',
+    ...RATE_LIMITS.loginIp,
+    message: 'Too many sign-in attempts from this network. Please wait a few minutes and try again.'
+  })
+);
+
+app.post(
+  '/api/auth/register',
+  limiter({
+    name: 'register-ip',
+    ...RATE_LIMITS.registerIp,
+    message: 'Too many sign-ups from this network. Please try again later.'
+  })
+);
+
+app.post(
+  '/api/listings',
+  limiter({
+    name: 'listing-create',
+    key: clientKey,
+    ...RATE_LIMITS.listingCreate,
+    message: 'You are posting too fast. You can create up to 20 listings per hour.'
+  })
+);
+
+app.post(
+  '/api/chat/send',
+  limiter({
+    name: 'chat-send',
+    key: clientKey,
+    ...RATE_LIMITS.chatSend,
+    message: 'You are sending messages too fast. Please slow down.'
+  })
+);
+
+
+/* =========================================================
    CLOUDINARY CONFIGURATION
    ========================================================= */
 
@@ -560,32 +729,6 @@ const escapeHtml = (str = '') =>
     "'": '&#39;'
   }[c]));
 
-// Small in-memory limiter (per server instance). Fine for one Render instance.
-const rateBuckets = new Map();
-
-const isRateLimited = (key, max, windowMs) => {
-  const now = Date.now();
-  const recent = (rateBuckets.get(key) || []).filter(
-    (ts) => now - ts < windowMs
-  );
-
-  if (recent.length >= max) {
-    rateBuckets.set(key, recent);
-    return true;
-  }
-
-  recent.push(now);
-  rateBuckets.set(key, recent);
-  return false;
-};
-
-setInterval(() => {
-  const cutoff = Date.now() - 60 * 60 * 1000;
-  for (const [key, stamps] of rateBuckets) {
-    if (stamps.every((ts) => ts < cutoff)) rateBuckets.delete(key);
-  }
-}, 10 * 60 * 1000).unref();
-
 // Sends through Brevo's HTTPS API (no SMTP port needed, which some hosts block)
 const sendMail = async ({ to, subject, html, devLabel, devLink }) => {
   if (!process.env.BREVO_API_KEY || !process.env.MAIL_FROM) {
@@ -1062,6 +1205,25 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const normalizedEmail = email.trim().toLowerCase();
 
+    // Wrong-password limit per account + IP (so one person can't lock out a victim from elsewhere)
+    const failKey = `login-fail:${normalizedEmail}:${req.ip}`;
+    const lock = rateCheck(
+      failKey,
+      RATE_LIMITS.loginFail.max,
+      RATE_LIMITS.loginFail.windowMs,
+      { consume: false }
+    );
+
+    if (lock.limited) {
+      res.set('Retry-After', String(lock.retryAfter));
+
+      return res.status(429).json({
+        success: false,
+        error: `Too many failed sign-in attempts. Try again in ${formatWait(lock.retryAfter)}, or use "Forgot password?".`,
+        retry_after: lock.retryAfter
+      });
+    }
+
     const result = await pool.query(
       `
         SELECT
@@ -1079,6 +1241,8 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      rateHit(failKey);
+
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password'
@@ -1120,11 +1284,15 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     if (!passwordMatches) {
+      rateHit(failKey);
+
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password'
       });
     }
+
+    rateReset(failKey);
 
     // Checked only after the password is right, so it can't be used to probe emails
     if (!dbUser.email_verified) {
