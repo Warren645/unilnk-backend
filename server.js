@@ -364,6 +364,13 @@ const initializeDatabase = async () => {
       );
     `);
 
+    await pool.query(`ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS bio VARCHAR(500) NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS campus VARCHAR(100) NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS programme VARCHAR(120) NOT NULL DEFAULT '',
+      ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+      ADD COLUMN IF NOT EXISTS avatar_public_id TEXT;`);
+
     /* ================= PASSWORD RESETS ================= */
 
     await pool.query(`
@@ -1447,7 +1454,8 @@ app.post('/api/auth/login', async (req, res) => {
           student_id,
           role,
           email_verified,
-          is_banned
+          is_banned,
+          bio, campus, programme, avatar_url, created_at
         FROM users
         WHERE LOWER(email) = $1
       `,
@@ -1530,7 +1538,9 @@ app.post('/api/auth/login', async (req, res) => {
       full_name: dbUser.full_name,
       email: dbUser.email,
       student_id: dbUser.student_id,
-      role: dbUser.role
+      role: dbUser.role,
+      bio: dbUser.bio, campus: dbUser.campus, programme: dbUser.programme,
+      avatar_url: dbUser.avatar_url, created_at: dbUser.created_at
     };
 
     const token = jwt.sign(
@@ -3153,7 +3163,7 @@ app.get('/api/sellers/:id', async (req, res) => {
 
   try {
     const userResult = await pool.query(
-      'SELECT id, full_name, created_at, is_banned FROM users WHERE id = $1',
+      'SELECT id, full_name, created_at, is_banned, bio, campus, programme, avatar_url FROM users WHERE id = $1',
       [sellerId]
     );
 
@@ -3243,7 +3253,8 @@ app.get('/api/sellers/:id', async (req, res) => {
       seller: {
         id: seller.id,
         full_name: seller.full_name,
-        joined: seller.created_at
+        joined: seller.created_at,
+        bio: seller.bio, campus: seller.campus, programme: seller.programme, avatar_url: seller.avatar_url
       },
       stats: stats.rows[0],
       listings: listings.rows,
@@ -3381,11 +3392,16 @@ app.delete('/api/sellers/:id/reviews', authenticateToken, async (req, res) => {
   Lets the frontend refresh the role after a promotion or demotion.
 */
 
+app.post('/api/profile/avatar', limiter({ name: 'profile-photo', key: clientKey, max: 15, windowMs: HOUR, message: 'Too many photo uploads. Try again later.' }));
+app.put('/api/profile/password', limiter({ name: 'profile-password', key: clientKey, max: 8, windowMs: 15 * MINUTE, message: 'Too many password attempts. Try again later.' }));
+
+require('./profile-routes').registerProfileRoutes(app, { pool, authenticateToken, cloudinary, bcrypt, validatePassword });
+
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
       `
-        SELECT id, full_name, email, student_id, role
+        SELECT id, full_name, email, student_id, role, bio, campus, programme, avatar_url, created_at
         FROM users
         WHERE id = $1
       `,
