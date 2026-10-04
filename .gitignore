@@ -1,0 +1,11 @@
+# secrets and local files - never commit these
+.env
+.env.*
+!.env.example
+
+# dependencies and uploads
+node_modules/
+uploads/
+
+# logs
+*.log
