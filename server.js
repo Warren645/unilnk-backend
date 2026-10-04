@@ -583,9 +583,31 @@ const initializeDatabase = async () => {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_listings_seller ON listings (seller_id);
     `);
-    await pool.query(`
+        await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_chat_pair
       ON chat_messages (sender_id, receiver_id, created_at);
+    `);
+
+    /*
+      Every chat is now a thread per item. The item title is stored with each
+      message, so a thread still says what it was about after the listing is
+      deleted.
+    */
+    await pool.query(`
+      ALTER TABLE chat_messages
+      ADD COLUMN IF NOT EXISTS listing_title VARCHAR(255);
+    `);
+
+    await pool.query(`
+      UPDATE chat_messages cm
+      SET listing_title = l.title
+      FROM listings l
+      WHERE cm.listing_id = l.id AND cm.listing_title IS NULL;
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_chat_thread
+      ON chat_messages (sender_id, receiver_id, listing_id);
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_chat_unread
@@ -693,8 +715,14 @@ const cleanupSoldListings = async () => {
       try {
         client = await pool.connect();
         await client.query('BEGIN');
-        await client.query(
-          'UPDATE chat_messages SET listing_id = NULL WHERE listing_id = ANY($1::int[])',
+                await client.query(
+          `
+            UPDATE chat_messages cm
+            SET listing_title = COALESCE(cm.listing_title, l.title),
+                listing_id = NULL
+            FROM listings l
+            WHERE cm.listing_id = l.id AND l.id = ANY($1::int[])
+          `,
           [ids]
         );
         await client.query('DELETE FROM listings WHERE id = ANY($1::int[])', [ids]);
@@ -2033,14 +2061,16 @@ app.delete(
     const { id } = req.params;
 
     try {
-      await pool.query(
+            await pool.query(
         `
-          UPDATE chat_messages
-          SET listing_id = NULL
-          WHERE listing_id IN (
-            SELECT id FROM listings
-            WHERE id = $1 AND seller_id = $2 AND removed_at IS NULL
-          )
+          UPDATE chat_messages cm
+          SET listing_title = COALESCE(cm.listing_title, l.title),
+              listing_id = NULL
+          FROM listings l
+          WHERE cm.listing_id = l.id
+            AND l.id = $1
+            AND l.seller_id = $2
+            AND l.removed_at IS NULL
         `,
         [id, req.user.id]
       );
@@ -2208,12 +2238,30 @@ app.get('/api/chat/stream', authenticateToken, (req, res) => {
   });
 });
 
+
+// ?listing_id=12 -> that item's thread; ?listing_id=general -> chat not about an item;
+// missing -> everything (kept for older app versions)
+const parseThreadFilter = (value) => {
+  if (value === undefined || value === '') return { all: true };
+  if (value === 'general' || value === '0' || value === 'null') {
+    return { all: false, listingId: null };
+  }
+
+  const id = Number(value);
+  if (!Number.isInteger(id) || id < 1) return { invalid: true };
+
+  return { all: false, listingId: id };
+};
+
 /* =========================================================
    CHAT ROUTES
    ========================================================= */
 
 /*
   GET CONVERSATIONS
+  One row per person AND per item, so a question about a coat and a question
+  about a bag from the same seller are separate threads. Messages that are not
+  about an item (listing_id null) form that person's "general" thread.
 */
 
 app.get(
@@ -2232,78 +2280,69 @@ app.get(
     try {
       const result = await pool.query(
         `
+          WITH mine AS (
+            SELECT
+              cm.*,
+              CASE
+                WHEN cm.sender_id = $1 THEN cm.receiver_id
+                ELSE cm.sender_id
+              END AS other_id
+            FROM chat_messages cm
+            WHERE cm.sender_id = $1 OR cm.receiver_id = $1
+          ),
+          threads AS (
+            SELECT
+              other_id,
+              listing_id,
+              (ARRAY_AGG(message ORDER BY created_at DESC, id DESC))[1]
+                AS last_message,
+              MAX(created_at) AS last_message_time,
+              (ARRAY_AGG(listing_title ORDER BY created_at DESC, id DESC)
+                FILTER (WHERE listing_title IS NOT NULL))[1] AS snapshot_title,
+              COUNT(*) FILTER (
+                WHERE receiver_id = $1 AND is_read = FALSE
+              )::int AS unread_raw
+            FROM mine
+            GROUP BY other_id, listing_id
+          )
           SELECT
             u.id AS user_id,
             u.full_name AS user_name,
             u.email,
             u.student_id,
-
-            (
-              SELECT message
-              FROM chat_messages
-              WHERE
-                (sender_id = $1 AND receiver_id = u.id)
-                OR
-                (sender_id = u.id AND receiver_id = $1)
-              ORDER BY created_at DESC
-              LIMIT 1
-            ) AS last_message,
-
-            (
-              SELECT created_at
-              FROM chat_messages
-              WHERE
-                (sender_id = $1 AND receiver_id = u.id)
-                OR
-                (sender_id = u.id AND receiver_id = $1)
-              ORDER BY created_at DESC
-              LIMIT 1
-            ) AS last_message_time,
-
-            (
-              SELECT COUNT(*)
-              FROM chat_messages
-              WHERE
-                receiver_id = $1
-                AND sender_id = u.id
-                AND is_read = FALSE
-                AND NOT EXISTS (
-                  SELECT 1 FROM user_blocks b
-                  WHERE b.blocker_id = $1 AND b.blocked_id = u.id
-                )
-            ) AS unread_count,
-
-            (
-              SELECT l.title
-              FROM chat_messages cm
-              JOIN listings l ON cm.listing_id = l.id
-              WHERE
-                (cm.sender_id = $1 AND cm.receiver_id = u.id)
-                OR
-                (cm.sender_id = u.id AND cm.receiver_id = $1)
-              ORDER BY cm.created_at DESC
-              LIMIT 1
-            ) AS listing_title,
-            EXISTS (
-              SELECT 1 FROM user_blocks b
-              WHERE b.blocker_id = $1 AND b.blocked_id = u.id
-            ) AS blocked_by_me,
-            EXISTS (
-              SELECT 1 FROM user_blocks b
-              WHERE b.blocker_id = u.id AND b.blocked_id = $1
-            ) AS blocked_me
-          FROM users u
-          WHERE u.id IN (
-            SELECT DISTINCT
-              CASE
-                WHEN sender_id = $1 THEN receiver_id
-                ELSE sender_id
-              END AS other_user
-            FROM chat_messages
-            WHERE sender_id = $1 OR receiver_id = $1
-          )
-          AND u.id != $1
-          ORDER BY last_message_time DESC NULLS LAST
+            t.listing_id,
+            CASE
+              WHEN t.listing_id IS NULL THEN NULL
+              ELSE COALESCE(l.title, t.snapshot_title)
+            END AS listing_title,
+            l.price AS listing_price,
+            l.image_url AS listing_image_url,
+            (l.id IS NOT NULL AND l.removed_at IS NULL) AS listing_available,
+            COALESCE(l.is_sold, FALSE) AS listing_sold,
+            t.last_message,
+            t.last_message_time,
+            CASE
+              WHEN bm.blocked_by_me THEN 0
+              ELSE t.unread_raw
+            END AS unread_count,
+            bm.blocked_by_me,
+            bm.blocked_me
+          FROM threads t
+          JOIN users u ON u.id = t.other_id
+          LEFT JOIN listings l ON l.id = t.listing_id
+          CROSS JOIN LATERAL (
+            SELECT
+              EXISTS (
+                SELECT 1 FROM user_blocks b
+                WHERE b.blocker_id = $1 AND b.blocked_id = u.id
+              ) AS blocked_by_me,
+              EXISTS (
+                SELECT 1 FROM user_blocks b
+                WHERE b.blocker_id = u.id AND b.blocked_id = $1
+              ) AS blocked_me
+          ) bm
+          WHERE u.id <> $1
+          ORDER BY t.last_message_time DESC NULLS LAST
         `,
         [userId]
       );
@@ -2391,7 +2430,28 @@ app.put(
       });
     }
 
+        const thread = parseThreadFilter(req.query.listing_id);
+
+    if (thread.invalid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid listing ID'
+      });
+    }
+
     try {
+      const params = [userId, otherUserId];
+      let threadSql = '';
+
+      if (!thread.all) {
+        if (thread.listingId === null) {
+          threadSql = 'AND listing_id IS NULL';
+        } else {
+          params.push(thread.listingId);
+          threadSql = 'AND listing_id = $3';
+        }
+      }
+
       await pool.query(
         `
           UPDATE chat_messages
@@ -2400,8 +2460,9 @@ app.put(
             receiver_id = $1
             AND sender_id = $2
             AND is_read = FALSE
+            ${threadSql}
         `,
-        [userId, otherUserId]
+        params
       );
 
       res.json({
@@ -2453,11 +2514,32 @@ app.get(
       });
     }
 
+        const thread = parseThreadFilter(req.query.listing_id);
+
+    if (thread.invalid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid listing ID'
+      });
+    }
+
     const limit = Math.min(requestedLimit, 100);
     const offset = requestedOffset;
 
+    const params = [userId, otherUserId, limit + 1, offset];
+    let threadSql = '';
+
+    if (!thread.all) {
+      if (thread.listingId === null) {
+        threadSql = 'AND cm.listing_id IS NULL';
+      } else {
+        params.push(thread.listingId);
+        threadSql = 'AND cm.listing_id = $5';
+      }
+    }
+
     try {
-      const [result, blockResult] = await Promise.all([
+      const [result, blockResult, listingResult] = await Promise.all([
         pool.query(
           `
             SELECT *
@@ -2466,22 +2548,25 @@ app.get(
                 cm.*,
                 u1.full_name AS sender_name,
                 u2.full_name AS receiver_name,
-                l.title AS listing_title
+                COALESCE(l.title, cm.listing_title) AS listing_title
               FROM chat_messages cm
               LEFT JOIN users u1 ON cm.sender_id = u1.id
               LEFT JOIN users u2 ON cm.receiver_id = u2.id
               LEFT JOIN listings l ON cm.listing_id = l.id
-              WHERE
-                (cm.sender_id = $1 AND cm.receiver_id = $2)
-                OR
-                (cm.sender_id = $2 AND cm.receiver_id = $1)
+                            WHERE
+                (
+                  (cm.sender_id = $1 AND cm.receiver_id = $2)
+                  OR
+                  (cm.sender_id = $2 AND cm.receiver_id = $1)
+                )
+                ${threadSql}
               ORDER BY cm.created_at DESC, cm.id DESC
               LIMIT $3
               OFFSET $4
             ) latest
             ORDER BY latest.created_at ASC, latest.id ASC
           `,
-          [userId, otherUserId, limit + 1, offset]
+          params
         ),
         pool.query(
           `
@@ -2495,8 +2580,19 @@ app.get(
                 WHERE blocker_id = $2 AND blocked_id = $1
               ) AS blocked_me
           `,
-          [userId, otherUserId]
-        )
+                    [userId, otherUserId]
+        ),
+        !thread.all && thread.listingId
+          ? pool.query(
+              `
+                SELECT id, title, price, image_url, is_sold, seller_id,
+                       (removed_at IS NULL) AS available
+                FROM listings
+                WHERE id = $1
+              `,
+              [thread.listingId]
+            )
+          : Promise.resolve({ rows: [] })
       ]);
 
       // One extra (oldest) row was fetched only to learn whether more exist
@@ -2506,7 +2602,8 @@ app.get(
       res.json({
         success: true,
         messages,
-        has_more: hasMore,
+                has_more: hasMore,
+        listing: listingResult.rows[0] || null,
         blocked_by_me: blockResult.rows[0].blocked_by_me,
         blocked_me: blockResult.rows[0].blocked_me
       });
@@ -2603,9 +2700,15 @@ app.post(
         If a listing ID is supplied, verify that it exists.
         Sold listings can still be discussed through existing chats.
       */
+            let listingTitle = null;
+
       if (listing_id) {
         const listingResult = await pool.query(
-          'SELECT id FROM listings WHERE id = $1 AND removed_at IS NULL',
+          `
+            SELECT id, title, seller_id
+            FROM listings
+            WHERE id = $1 AND removed_at IS NULL
+          `,
           [listing_id]
         );
 
@@ -2615,19 +2718,35 @@ app.post(
             error: 'Listing not found'
           });
         }
+
+        // The item must belong to one of the two people in this chat
+        const sellerId = Number(listingResult.rows[0].seller_id);
+
+        if (
+          sellerId !== Number(sender_id) &&
+          sellerId !== Number(receiver_id)
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: 'This listing does not belong to this conversation'
+          });
+        }
+
+        listingTitle = listingResult.rows[0].title;
       }
 
       const result = await pool.query(
         `
-          INSERT INTO chat_messages
-            (sender_id, receiver_id, listing_id, message)
-          VALUES ($1, $2, $3, $4)
+                    INSERT INTO chat_messages
+            (sender_id, receiver_id, listing_id, listing_title, message)
+          VALUES ($1, $2, $3, $4, $5)
           RETURNING *
         `,
         [
           sender_id,
           receiver_id,
           listing_id || null,
+          listingTitle,
           message.trim()
         ]
       );
@@ -3767,12 +3886,12 @@ app.delete(
 
         const inserted = await client.query(
           `
-            INSERT INTO chat_messages
-              (sender_id, receiver_id, listing_id, message)
-            VALUES ($1, $2, NULL, $3)
+                        INSERT INTO chat_messages
+              (sender_id, receiver_id, listing_id, listing_title, message)
+            VALUES ($1, $2, NULL, $3, $4)
             RETURNING *
           `,
-          [req.admin.id, listing.seller_id, message]
+          [req.admin.id, listing.seller_id, listing.title, message]
         );
 
         notification = {
@@ -3917,15 +4036,16 @@ app.put(
       if (canNotify) {
         const inserted = await client.query(
           `
-            INSERT INTO chat_messages
-              (sender_id, receiver_id, listing_id, message)
-            VALUES ($1, $2, $3, $4)
+                        INSERT INTO chat_messages
+              (sender_id, receiver_id, listing_id, listing_title, message)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING *
           `,
           [
             req.admin.id,
             listing.seller_id,
             listing.id,
+            listing.title,
             `Good news: your listing "${listing.title}" was reviewed again and is back on the marketplace.` +
               (note ? ` Moderator note: ${note}` : '')
           ]
